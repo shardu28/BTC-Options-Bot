@@ -1,85 +1,106 @@
 import os
-import time
 import requests
-import logging
-from requests.auth import HTTPBasicAuth
+from dotenv import load_dotenv
+from datetime import datetime
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+load_dotenv()
 
-# Load credentials from GitHub secrets
-client_id = os.getenv("CLIENT_ID")
-client_secret = os.getenv("CLIENT_SECRET")
+# Load credentials from environment variables
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
-# Deribit base URL
-DERIBIT_BASE = "https://www.deribit.com/api/v2"
+BASE_URL = "https://www.deribit.com/api/v2"
 
-# Step 1: Authenticate with Deribit and get access token
-def get_access_token():
-    logger.info("Authenticating with Deribit API...")
-    url = f"{DERIBIT_BASE}/public/auth"
-    params = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret
-    }
-    response = requests.get(url, params=params)
+# Authenticate with Deribit API
+def authenticate():
+    response = requests.get(
+        f"{BASE_URL}/public/auth",
+        params={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+    )
     response.raise_for_status()
-    data = response.json()
-    access_token = data["result"]["access_token"]
-    logger.info("Access token received.")
-    return access_token
+    return response.json()["result"]["access_token"]
 
-# Step 2: Get option instruments for BTC or ETH
-def get_option_instruments(access_token, currency="BTC"):
-    url = f"{DERIBIT_BASE}/public/get_instruments"
-    params = {
-        "currency": currency,
-        "kind": "option",
-        "expired": False
-    }
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    instruments = response.json()["result"]
-    logger.info(f"Retrieved {len(instruments)} {currency} options.")
-    return instruments
-
-# Step 3: Get greeks and option data for a specific instrument
-def get_option_data(access_token, instrument_name):
-    url = f"{DERIBIT_BASE}/public/ticker"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"instrument_name": instrument_name}
-    response = requests.get(url, headers=headers, params=params)
+# Fetch instruments for BTC or ETH options
+def get_option_instruments(token, currency):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(
+        f"{BASE_URL}/public/get_instruments",
+        headers=headers,
+        params={"currency": currency, "kind": "option", "expired": False},
+    )
     response.raise_for_status()
     return response.json()["result"]
 
-# Example routine
-def fetch_options_data():
-    try:
-        access_token = get_access_token()
+# Get greeks and mark price for a given instrument
+def get_option_details(token, instrument_name):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(
+        f"{BASE_URL}/public/ticker",
+        headers=headers,
+        params={"instrument_name": instrument_name},
+    )
+    response.raise_for_status()
+    return response.json()["result"]
 
-        for asset in ["BTC", "ETH"]:
-            instruments = get_option_instruments(access_token, asset)
+# Select ATM/OTM call and put options for closest expiry
+def select_strangle_options(instruments):
+    if not instruments:
+        return None, None
 
-            # Take the nearest expiry option (as example)
-            option = instruments[0]
-            instrument_name = option["instrument_name"]
+    # Sort by expiration date and strike
+    instruments.sort(key=lambda x: (x["expiration_timestamp"], x["strike"]))
+    expiry = instruments[0]["expiration_timestamp"]
+    expiry_instruments = [i for i in instruments if i["expiration_timestamp"] == expiry]
 
-            option_data = get_option_data(access_token, instrument_name)
+    atm_strike = min(expiry_instruments, key=lambda x: abs(x["strike"] - x["index_price"]))["strike"]
 
-            logger.info(f"\nAsset: {asset}")
-            logger.info(f"Instrument: {instrument_name}")
-            logger.info(f"Mark Price: {option_data.get('mark_price')}")
-            logger.info(f"Delta: {option_data.get('greeks', {}).get('delta')}")
-            logger.info(f"Gamma: {option_data.get('greeks', {}).get('gamma')}")
-            logger.info(f"Theta: {option_data.get('greeks', {}).get('theta')}")
-            logger.info(f"Vega: {option_data.get('greeks', {}).get('vega')}")
+    # Find nearest OTM call and put options
+    otm_call = next((i for i in expiry_instruments if i["option_type"] == "call" and i["strike"] > atm_strike), None)
+    otm_put = next((i for i in expiry_instruments if i["option_type"] == "put" and i["strike"] < atm_strike), None)
 
-            time.sleep(1)  # To avoid rate limits
+    return otm_call, otm_put
 
-    except Exception as e:
-        logger.error(f"Error fetching options data: {e}")
+# Format the trade setup
+
+def format_trade_signal(option, details):
+    premium = details["mark_price"]
+    sl = round(premium * 0.5, 4)
+    target = round(premium * 2, 4)
+    strike = option["strike"]
+    expiry = datetime.utcfromtimestamp(option["expiration_timestamp"] / 1000).strftime("%Y-%m-%d")
+    return (
+        f"Buy {option['option_type'].upper()} Option\n"
+        f"Instrument: {option['instrument_name']}\n"
+        f"Strike: {strike}, Expiry: {expiry}\n"
+        f"Premium: {premium}, SL: {sl}, Target: {target}\n"
+    )
+
+def main():
+    token = authenticate()
+
+    for asset in ["BTC", "ETH"]:
+        print(f"\n=== {asset} Option Trade Setup ===")
+        instruments = get_option_instruments(token, asset)
+
+        # Add index price to each instrument for ATM calc
+        index_price = next((i for i in instruments if i["instrument_name"].endswith("C")), {}).get("index_price", 0)
+        for i in instruments:
+            i["index_price"] = index_price
+
+        call_option, put_option = select_strangle_options(instruments)
+
+        if call_option and put_option:
+            call_details = get_option_details(token, call_option["instrument_name"])
+            put_details = get_option_details(token, put_option["instrument_name"])
+
+            print(format_trade_signal(call_option, call_details))
+            print(format_trade_signal(put_option, put_details))
+        else:
+            print("No valid strangle options found.")
 
 if __name__ == "__main__":
-    fetch_options_data()
+    main()
