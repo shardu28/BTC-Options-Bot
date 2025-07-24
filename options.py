@@ -1,106 +1,144 @@
 import os
 import requests
+import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 
-# Load credentials from environment variables
+# Load API credentials from GitHub secrets or .env
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+SMTP_EMAIL = os.getenv("SMTP_EMAIL")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
-BASE_URL = "https://www.deribit.com/api/v2"
+DERIBIT_BASE_URL = "https://www.deribit.com/api/v2"
 
-# Authenticate with Deribit API
-def authenticate():
-    response = requests.get(
-        f"{BASE_URL}/public/auth",
-        params={
-            "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
-    )
-    response.raise_for_status()
-    return response.json()["result"]["access_token"]
+# Fetch BTC spot price
+def get_btc_spot_price():
+    try:
+        response = requests.get(f"{DERIBIT_BASE_URL}/public/ticker?instrument_name=BTC-PERPETUAL")
+        response.raise_for_status()
+        data = response.json()
+        return data['result']['last_price']
+    except Exception as e:
+        print(f"Error fetching BTC spot price: {e}")
+        return "Unavailable"
 
-# Fetch instruments for BTC or ETH options
-def get_option_instruments(token, currency):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(
-        f"{BASE_URL}/public/get_instruments",
-        headers=headers,
-        params={"currency": currency, "kind": "option", "expired": False},
-    )
-    response.raise_for_status()
-    return response.json()["result"]
+# Fetch crypto news from CryptoPanic
+def get_crypto_news():
+    try:
+        response = requests.get("https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC&public=true")
+        response.raise_for_status()
+        news_data = response.json()
+        news_items = news_data.get('results', [])[:5]
+        headlines = [f"- {item['title']} ({item['published_at'][:10]})" for item in news_items]
+        return "\n".join(headlines)
+    except Exception as e:
+        print(f"Error fetching news: {e}")
+        return "No news available"
 
-# Get greeks and mark price for a given instrument
-def get_option_details(token, instrument_name):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(
-        f"{BASE_URL}/public/ticker",
-        headers=headers,
-        params={"instrument_name": instrument_name},
-    )
-    response.raise_for_status()
-    return response.json()["result"]
+# Authenticate and get access token
+def get_access_token():
+    try:
+        response = requests.get(f"{DERIBIT_BASE_URL}/public/auth?grant_type=client_credentials&client_id={CLIENT_ID}&client_secret={CLIENT_SECRET}")
+        response.raise_for_status()
+        return response.json()['result']['access_token']
+    except Exception as e:
+        print(f"Error fetching access token: {e}")
+        return None
 
-# Select ATM/OTM call and put options for closest expiry
-def select_strangle_options(instruments):
-    if not instruments:
+# Fetch option instruments
+def fetch_option_instruments(token):
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(f"{DERIBIT_BASE_URL}/public/get_instruments?currency=BTC&kind=option&expired=false", headers=headers)
+        response.raise_for_status()
+        return response.json()['result']
+    except Exception as e:
+        print(f"Error fetching options: {e}")
+        return []
+
+# Select best strangle trade (based on strike & expiry proximity)
+def select_strangle_options(options):
+    try:
+        sorted_options = sorted(options, key=lambda x: (x['expiration_timestamp'], abs(x['strike'] - 50000)))
+        call = next((opt for opt in sorted_options if opt['option_type'] == 'call'), None)
+        put = next((opt for opt in sorted_options if opt['option_type'] == 'put'), None)
+        return call, put
+    except Exception as e:
+        print(f"Error selecting strangle options: {e}")
         return None, None
 
-    # Sort by expiration date and strike
-    instruments.sort(key=lambda x: (x["expiration_timestamp"], x["strike"]))
-    expiry = instruments[0]["expiration_timestamp"]
-    expiry_instruments = [i for i in instruments if i["expiration_timestamp"] == expiry]
+# Send email report
+def send_email(subject, body):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = SMTP_EMAIL
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
 
-    atm_strike = min(expiry_instruments, key=lambda x: abs(x["strike"] - x["index_price"]))["strike"]
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"Error sending email: {e}")
 
-    # Find nearest OTM call and put options
-    otm_call = next((i for i in expiry_instruments if i["option_type"] == "call" and i["strike"] > atm_strike), None)
-    otm_put = next((i for i in expiry_instruments if i["option_type"] == "put" and i["strike"] < atm_strike), None)
-
-    return otm_call, otm_put
-
-# Format the trade setup
-
-def format_trade_signal(option, details):
-    premium = details["mark_price"]
-    sl = round(premium * 0.5, 4)
-    target = round(premium * 2, 4)
-    strike = option["strike"]
-    expiry = datetime.utcfromtimestamp(option["expiration_timestamp"] / 1000).strftime("%Y-%m-%d")
-    return (
-        f"Buy {option['option_type'].upper()} Option\n"
-        f"Instrument: {option['instrument_name']}\n"
-        f"Strike: {strike}, Expiry: {expiry}\n"
-        f"Premium: {premium}, SL: {sl}, Target: {target}\n"
-    )
-
+# Main process
 def main():
-    token = authenticate()
+    access_token = get_access_token()
+    if not access_token:
+        print("Cannot proceed without access token.")
+        return
 
-    for asset in ["BTC", "ETH"]:
-        print(f"\n=== {asset} Option Trade Setup ===")
-        instruments = get_option_instruments(token, asset)
+    btc_price = get_btc_spot_price()
+    crypto_news = get_crypto_news()
 
-        # Add index price to each instrument for ATM calc
-        index_price = next((i for i in instruments if i["instrument_name"].endswith("C")), {}).get("index_price", 0)
-        for i in instruments:
-            i["index_price"] = index_price
+    options = fetch_option_instruments(access_token)
+    call_option, put_option = select_strangle_options(options)
 
-        call_option, put_option = select_strangle_options(instruments)
+    if not call_option or not put_option:
+        print("No valid strangle setup found.")
+        return
 
-        if call_option and put_option:
-            call_details = get_option_details(token, call_option["instrument_name"])
-            put_details = get_option_details(token, put_option["instrument_name"])
+    # Define entry and exit logic (1:2 RRR)
+    call_entry = call_option['last_price']
+    call_tp = round(call_entry * 2, 2)
+    call_sl = round(call_entry * 0.5, 2)
 
-            print(format_trade_signal(call_option, call_details))
-            print(format_trade_signal(put_option, put_details))
-        else:
-            print("No valid strangle options found.")
+    put_entry = put_option['last_price']
+    put_tp = round(put_entry * 2, 2)
+    put_sl = round(put_entry * 0.5, 2)
+
+    # Email body
+    body = f"""
+📈 BTC Spot Price: ${btc_price}
+
+📰 Top Crypto News:
+{crypto_news}
+
+🟢 STRANGLE TRADE SETUP:
+
+🔸 CALL OPTION
+Instrument: {call_option['instrument_name']}
+Entry Price: {call_entry}
+Target (TP): {call_tp}
+Stop Loss: {call_sl}
+
+🔹 PUT OPTION
+Instrument: {put_option['instrument_name']}
+Entry Price: {put_entry}
+Target (TP): {put_tp}
+Stop Loss: {put_sl}
+
+⏰ Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+    send_email(subject="📬 BTC Options Trade Setup - Daily Strangle", body=body)
 
 if __name__ == "__main__":
     main()
