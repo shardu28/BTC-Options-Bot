@@ -158,15 +158,25 @@ def select_best_strangle():
 # --------------------------
 
 def send_email(subject, body):
+    import os
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    import smtplib
+
+    SMTP_EMAIL = os.getenv("SMTP_EMAIL")
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        print("❌ Environment variables SMTP_EMAIL or SMTP_PASSWORD not found.")
+        return
+
     msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
     msg["To"] = SMTP_EMAIL
     msg["Subject"] = subject
-
     msg.attach(MIMEText(body, "plain"))
 
-    print("SMTP_EMAIL:", SMTP_EMAIL)
-    print("Trying to send email...")
+    print("📤 Trying to send email from:", SMTP_EMAIL)
 
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
@@ -219,6 +229,7 @@ RRR: 1:2
     print(f"Email Body:\n{body}")
 
     send_email(subject, body)
+
 
 
 
