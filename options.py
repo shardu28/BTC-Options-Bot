@@ -1,142 +1,205 @@
 import os
 import requests
-import datetime
+from dotenv import load_dotenv
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from dotenv import load_dotenv
+from datetime import datetime
 
+# Load credentials from .env
 load_dotenv()
-
-# Load API credentials from GitHub secrets or .env
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+CLIENT_ID = os.getenv("DERIBIT_CLIENT_ID")
+CLIENT_SECRET = os.getenv("DERIBIT_CLIENT_SECRET")
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
-DERIBIT_BASE_URL = "https://www.deribit.com/api/v2"
+DERIBIT_BASE_URL = "https://www.deribit.com"
 
-# Fine-tuned option Greek filters (adjusted for $20/day goal)
-greek_filters = {
-    "delta_min": 0.15,
-    "delta_max": 0.45,
-    "theta_min": 0.015,
-    "vega_max": 0.25,
-    "gamma_max": 0.15,
-    "min_volume": 30,
-    "min_oi": 80
-}
+# --------------------------
+# Deribit API Functions
+# --------------------------
 
-def get_option_greeks(option):
-    return {
-        "delta": option.get("greeks", {}).get("delta", 0),
-        "theta": option.get("greeks", {}).get("theta", 0),
-        "vega": option.get("greeks", {}).get("vega", 0),
-        "gamma": option.get("greeks", {}).get("gamma", 0),
-        "volume": option.get("volume", 0),
-        "oi": option.get("open_interest", 0),
-        "price": option.get("last_price", 0),
-        "iv": option.get("iv", 0)
+def get_access_token():
+    url = f"{DERIBIT_BASE_URL}/api/v2/public/auth"
+    params = {
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET
     }
 
-def is_valid_option(option):
-    g = get_option_greeks(option)
-    return (
-        greek_filters["delta_min"] <= abs(g["delta"]) <= greek_filters["delta_max"]
-        and g["theta"] >= greek_filters["theta_min"]
-        and g["vega"] <= greek_filters["vega_max"]
-        and g["gamma"] <= greek_filters["gamma_max"]
-        and g["volume"] >= greek_filters["min_volume"]
-        and g["oi"] >= greek_filters["min_oi"]
-    )
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise Exception(f"Access token error: {data['error']}")
+        return data["result"]["access_token"]
+    except requests.RequestException as e:
+        raise Exception(f"Error fetching access token: {e}")
 
-def expected_payoff(option):
-    g = get_option_greeks(option)
-    delta_value = abs(g["delta"]) * g["price"]
-    theta_value = g["theta"] * g["price"]
-    vega_penalty = g["vega"] * 0.1
-    return delta_value + theta_value - vega_penalty
+def get_index_price():
+    url = f"{DERIBIT_BASE_URL}/api/v2/public/get_index_price"
+    params = {"index_name": "btc_usd"}
 
-def rank_options(options):
-    valid_opts = [opt for opt in options if is_valid_option(opt)]
-    ranked = sorted(valid_opts, key=expected_payoff, reverse=True)
-    return ranked
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        return data["result"]["index_price"]
+    except Exception as e:
+        raise Exception(f"Error fetching index price: {e}")
 
-def find_best_strangle(calls, puts, target_payoff=20):
-    ranked_calls = rank_options(calls)
-    ranked_puts = rank_options(puts)
-    best_strangles = []
+def get_options_instruments():
+    url = f"{DERIBIT_BASE_URL}/api/v2/public/get_instruments"
+    params = {
+        "currency": "BTC",
+        "kind": "option",
+        "expired": "false"
+    }
 
-    for call in ranked_calls:
-        for put in ranked_puts:
-            total_payoff = expected_payoff(call) + expected_payoff(put)
-            if total_payoff >= target_payoff:
-                best_strangles.append((call, put, total_payoff))
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise Exception(f"Instruments API error: {data['error']}")
+        return data.get("result", [])
+    except requests.RequestException as e:
+        raise Exception(f"Network error while fetching instruments: {e}")
 
-    if best_strangles:
-        best_strangles.sort(key=lambda x: x[2], reverse=True)
-        best_call, best_put, payoff = best_strangles[0]
-        return {
-            "call": best_call,
-            "put": best_put,
-            "expected_payoff": payoff
-        }
-    return None
+def get_ticker(instrument_name):
+    url = f"{DERIBIT_BASE_URL}/api/v2/public/ticker"
+    params = {"instrument_name": instrument_name}
 
-def fetch_option_chain():
-    response = requests.get(f"{DERIBIT_BASE_URL}/public/get_instruments?currency=BTC&kind=option")
-    instruments = response.json().get("result", [])
-    all_options = []
-    for instrument in instruments:
-        details = requests.get(f"{DERIBIT_BASE_URL}/public/ticker?instrument_name={instrument['instrument_name']}").json()
-        if details.get("result"):
-            all_options.append(details["result"])
-    return all_options
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise Exception(f"Ticker API error for {instrument_name}: {data['error']}")
+        return data.get("result", {})
+    except requests.RequestException as e:
+        raise Exception(f"Network error while fetching ticker for {instrument_name}: {e}")
 
-def separate_calls_and_puts(options):
-    calls = [opt for opt in options if "C" in opt["instrument_name"]]
-    puts = [opt for opt in options if "P" in opt["instrument_name"]]
-    return calls, puts
+# --------------------------
+# Trade Logic
+# --------------------------
+
+def select_best_strangle():
+    try:
+        index_price = get_index_price()
+        instruments = get_options_instruments()
+
+        # Narrow down to nearest expiry
+        nearest_expiry = min(set(i["expiration_timestamp"] for i in instruments))
+        same_expiry = [i for i in instruments if i["expiration_timestamp"] == nearest_expiry]
+
+        # Find nearest ATM Call to BUY and OTM Put to SELL
+        atm_call = None
+        otm_put = None
+        min_call_diff = float("inf")
+        max_put_diff = float("-inf")
+
+        for instr in same_expiry:
+            strike = instr["strike"]
+            option_type = instr["option_type"]
+            diff = abs(strike - index_price)
+
+            if option_type == "call":
+                if diff < min_call_diff:
+                    min_call_diff = diff
+                    atm_call = instr
+
+            if option_type == "put" and strike < index_price:
+                if strike > max_put_diff:
+                    max_put_diff = strike
+                    otm_put = instr
+
+        if atm_call and otm_put:
+            call_data = get_ticker(atm_call["instrument_name"])
+            put_data = get_ticker(otm_put["instrument_name"])
+
+            return {
+                "call": {
+                    "instrument": atm_call["instrument_name"],
+                    "strike": atm_call["strike"],
+                    "price": call_data.get("mark_price", 0),
+                },
+                "put": {
+                    "instrument": otm_put["instrument_name"],
+                    "strike": otm_put["strike"],
+                    "price": put_data.get("mark_price", 0),
+                },
+                "index_price": index_price
+            }
+        else:
+            return None
+    except Exception as e:
+        print(f"Strangle selection error: {e}")
+        return None
+
+# --------------------------
+# Email Reporting
+# --------------------------
 
 def send_email(subject, body):
     msg = MIMEMultipart()
-    msg['From'] = SMTP_EMAIL
-    msg['To'] = SMTP_EMAIL
-    msg['Subject'] = subject
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Subject"] = subject
 
-    msg.attach(MIMEText(body, 'plain'))
+    msg.attach(MIMEText(body, "plain"))
 
     try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(SMTP_EMAIL, SMTP_PASSWORD)
         server.send_message(msg)
         server.quit()
-        print("Email sent successfully!")
+        print("Email sent successfully.")
     except Exception as e:
-        print("Error sending email:", e)
+        print(f"Email failed: {e}")
+
+# --------------------------
+# Main Run
+# --------------------------
+
+def run_bot():
+    print("Running BTC Options Strangle Bot...\n")
+    setup = select_best_strangle()
+
+    if setup:
+        call = setup["call"]
+        put = setup["put"]
+        index = setup["index_price"]
+
+        subject = f"BTC Strangle Trade Setup – {datetime.utcnow().strftime('%Y-%m-%d')}"
+        body = f"""
+BTC Index Price: ${index:,.2f}
+
+🟢 Buy CALL
+Instrument: {call['instrument']}
+Strike: {call['strike']}
+Mark Price: ${call['price']:,.2f}
+
+🔴 Sell PUT
+Instrument: {put['instrument']}
+Strike: {put['strike']}
+Mark Price: ${put['price']:,.2f}
+
+🎯 Strategy: Long CALL + Short PUT (Strangle)
+RRR: 1:2
+Target Profit: ${round(call['price'] * 2, 2)}
+Stop Loss: ${round(call['price'] * 0.5, 2)}
+
+Manually place trades on Deribit.
+        """
+    else:
+        subject = f"BTC Options Update – {datetime.utcnow().strftime('%Y-%m-%d')}"
+        body = "No suitable strangle setup found based on current filters."
+
+    send_email(subject, body)
 
 if __name__ == "__main__":
-    all_options = fetch_option_chain()
-    calls, puts = separate_calls_and_puts(all_options)
-    best_strangle = find_best_strangle(calls, puts, target_payoff=20)
-
-    if best_strangle:
-        call = best_strangle["call"]
-        put = best_strangle["put"]
-        payoff = best_strangle["expected_payoff"]
-
-        body = f"""
-        Daily BTC Options Strangle Suggestion:
-
-        📈 Call Option: {call['instrument_name']}
-        Price: {call['last_price']} | Delta: {call['greeks']['delta']} | Theta: {call['greeks']['theta']}
-
-        📉 Put Option: {put['instrument_name']}
-        Price: {put['last_price']} | Delta: {put['greeks']['delta']} | Theta: {put['greeks']['theta']}
-
-        ✅ Expected Combined Payoff: ${round(payoff, 2)}
-        """
-        send_email("BTC Options Strangle Suggestion - Daily", body)
-    else:
-        send_email("BTC Options Alert", "No suitable strangle found today based on current filters.")
+    run_bot()
