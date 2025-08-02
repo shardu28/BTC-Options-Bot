@@ -12,7 +12,6 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-RECIPIENT_EMAIL = os.getenv("SMTP_EMAIL")
 
 DERIBIT_BASE_URL = "https://www.deribit.com"
 
@@ -159,13 +158,9 @@ def select_best_strangle():
 # --------------------------
 
 def send_email(subject, body):
-    SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-    RECIPIENT_EMAIL = SMTP_EMAIL  # Self-email
-
     msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
-    msg["To"] = RECIPIENT_EMAIL
+    msg["To"] = SMTP_EMAIL
     msg["Subject"] = subject
 
     msg.attach(MIMEText(body, "plain"))
@@ -220,6 +215,7 @@ RRR: 1:2
         body = "No suitable strangle setup found based on current filters."
 
     send_email(subject, body)
+
 
 
 
