@@ -229,6 +229,7 @@ RRR: 1:2
     print(f"Email Body:\n{body}")
 
     send_email(subject, body)
+run_bot()
 
 
 
