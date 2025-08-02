@@ -1,235 +1,115 @@
 import os
 import requests
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
 
-# Load credentials from .env
 load_dotenv()
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+DERIVATION = "BTC"  # or 'WBTC' if labeled
 
-DERIBIT_BASE_URL = "https://www.deribit.com"
+LYRA_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/lyra-finance/optimism-v2"
+GRAPHQL_QUERY = """
+query fetchOptions($market: String!) {
+  options(first: 200, where: {market: $market, openInterest_gt: 10}, orderBy: strikePrice, orderDirection: asc) {
+    id
+    strikePrice
+    expiryTimestamp
+    isCall
+    openInterest
+    impliedVolatility
+    delta
+    volume
+    premium
+    board { expiryTimestamp }
+  }
+}
+"""
 
-# --------------------------
-# Deribit API Functions
-# --------------------------
+def fetch_options(market="WBTC"):
+    resp = requests.post(LYRA_SUBGRAPH, json={'query': GRAPHQL_QUERY, 'variables': {'market': market}})
+    data = resp.json().get("data", {}).get("options", [])
+    return data
 
-def get_access_token():
-    url = f"{DERIBIT_BASE_URL}/api/v2/public/auth"
-    params = {
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET
-    }
+def next_friday_ts():
+    today = datetime.utcnow().date()
+    fd = today + timedelta((4 - today.weekday()) % 7)
+    return int(datetime(fd.year, fd.month, fd.day, 0, 0).timestamp())
 
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise Exception(f"Access token error: {data['error']}")
-        return data["result"]["access_token"]
-    except requests.RequestException as e:
-        raise Exception(f"Error fetching access token: {e}")
+def select_strangle(opts):
+    target_expiry = next_friday_ts()
+    arr = [o for o in opts if o['expiryTimestamp'] == target_expiry]
+    if not arr: return None
 
-def get_index_price():
-    url = f"{DERIBIT_BASE_URL}/api/v2/public/get_index_price"
-    params = {"index_name": "btc_usd"}
+    calls = [o for o in arr if o['isCall'] and 0.3 <= o['delta'] <= 0.5]
+    puts = [o for o in arr if not o['isCall'] and -0.5 <= o['delta'] <= -0.3]
 
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        return data["result"]["index_price"]
-    except Exception as e:
-        raise Exception(f"Error fetching index price: {e}")
+    # sort by liquidity: openInterest × volume
+    calls.sort(key=lambda o: o['openInterest'] * o['volume'], reverse=True)
+    puts.sort(key=lambda o: o['openInterest'] * o['volume'], reverse=True)
+    if not calls or not puts: return None
 
-def get_options_instruments():
-    url = f"{DERIBIT_BASE_URL}/api/v2/public/get_instruments"
-    params = {
-        "currency": "BTC",
-        "kind": "option",
-        "expired": "false"
-    }
+    call = calls[0]
+    put = next((p for p in puts if p['strikePrice'] < call['strikePrice']), puts[0])
 
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise Exception(f"Instruments API error: {data['error']}")
-        return data.get("result", [])
-    except requests.RequestException as e:
-        raise Exception(f"Network error while fetching instruments: {e}")
-
-def get_ticker(instrument_name):
-    url = f"{DERIBIT_BASE_URL}/api/v2/public/ticker"
-    params = {"instrument_name": instrument_name}
-
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise Exception(f"Ticker API error for {instrument_name}: {data['error']}")
-        return data.get("result", {})
-    except requests.RequestException as e:
-        raise Exception(f"Network error while fetching ticker for {instrument_name}: {e}")
-
-def get_price(instrument_name):
-    ticker = get_ticker(instrument_name)
-
-    bid = ticker.get("best_bid", 0.0)
-    ask = ticker.get("best_ask", 0.0)
-    mark_price = ticker.get("mark_price", 0.0)
-
-    if bid and ask:
-        price = (bid + ask) / 2
-    elif mark_price:
-        price = mark_price
-    else:
-        price = 0.0
-
-    return round(price, 2), round(mark_price, 2)
-
-# --------------------------
-# Trade Logic
-# --------------------------
-
-def select_best_strangle():
-    try:
-        index_price = get_index_price()
-        instruments = get_options_instruments()
-
-        # Filter out dead options (no bid/ask/mark price)
-        live_instruments = []
-        for instr in instruments:
-            ticker = get_ticker(instr["instrument_name"])
-            if ticker.get("mark_price") or (ticker.get("best_bid") and ticker.get("best_ask")):
-                live_instruments.append(instr)
-
-        nearest_expiry = min(set(i["expiration_timestamp"] for i in live_instruments))
-        same_expiry = [i for i in live_instruments if i["expiration_timestamp"] == nearest_expiry]
-
-        atm_call = None
-        otm_put = None
-        min_call_diff = float("inf")
-        max_put_diff = float("-inf")
-
-        for instr in same_expiry:
-            strike = instr["strike"]
-            option_type = instr["option_type"]
-            diff = abs(strike - index_price)
-
-            if option_type == "call":
-                if diff < min_call_diff:
-                    min_call_diff = diff
-                    atm_call = instr
-
-            if option_type == "put" and strike < index_price:
-                if strike > max_put_diff:
-                    max_put_diff = strike
-                    otm_put = instr
-
-        if atm_call and otm_put:
-            call_entry, call_mark = get_price(atm_call["instrument_name"])
-            put_entry, put_mark = get_price(otm_put["instrument_name"])
-
-            return {
-                "call": {
-                    "instrument": atm_call["instrument_name"],
-                    "strike": atm_call["strike"],
-                    "entry": call_entry,
-                    "mark_price": call_mark,
-                },
-                "put": {
-                    "instrument": otm_put["instrument_name"],
-                    "strike": otm_put["strike"],
-                    "entry": put_entry,
-                    "mark_price": put_mark,
-                },
-                "index_price": index_price
-            }
-        else:
-            return None
-    except Exception as e:
-        print(f"Strangle selection error: {e}")
-        return None
-
-# --------------------------
-# Email Reporting
-# --------------------------
+    return call, put
 
 def send_email(subject, body):
-    SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
     if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print("❌ Environment variables SMTP_EMAIL or SMTP_PASSWORD not found.")
+        print("❌ Missing SMTP credentials")
         return
-
     msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
     msg["To"] = SMTP_EMAIL
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    print("📤 Trying to send email from:", SMTP_EMAIL)
-
+    print(f"📤 Sending email from {SMTP_EMAIL}...")
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(SMTP_EMAIL, SMTP_PASSWORD)
         server.send_message(msg)
         server.quit()
-        print("✅ Email sent successfully.")
+        print("✅ Email Sent.")
     except Exception as e:
-        print("❌ Email sending failed:", e)
-
-# --------------------------
-# Main Run
-# --------------------------
+        print("❌ Email error:", e)
 
 def run_bot():
-    print("Running BTC Options Strangle Bot...\n")
-    setup = select_best_strangle()
+    opts = fetch_options("WBTC")
+    out = select_strangle(opts)
+    if not out:
+        send_email("BTC Strangle Bot – No Trade", "No suitable setup found")
+        return
+    call, put = out
+    body = f"""
+💡 BTC Strangle Setup (Expiry Friday)
 
-    if setup:
-        call = setup["call"]
-        put = setup["put"]
-        index = setup["index_price"]
+📈 Buy Call: {call['id']}
+ Strike: {call['strikePrice']}
+ Premium: {call['premium']}
+ IV: {call['impliedVolatility']:.3f}
+ Delta: {call['delta']}
+ OI×Vol: {call['openInterest']}×{call['volume']}
 
-        subject = f"BTC Strangle Trade Setup – {datetime.utcnow().strftime('%Y-%m-%d')}"
-        body = f"""
-BTC Index Price: ${index:,.2f}
+📉 Sell Put: {put['id']}
+ Strike: {put['strikePrice']}
+ Premium: {put['premium']}
+ IV: {put['impliedVolatility']:.3f}
+ Delta: {put['delta']}
+ OI×Vol: {put['openInterest']}×{put['volume']}
 
-🟢 Buy CALL
-Instrument: {call['instrument']}
-Strike: {call['strike']}
-Mark Price: ${call['mark_price']:,.2f}
-Entry: ${call['entry']:,.2f} | Target: ${round(call['entry']*2, 2)} | SL: ${round(call['entry']*0.5, 2)}
+🎯 Entry Spread: Call premium − Put premium = ${call['premium'] - put['premium']:.2f}
+ Target (×2): ${2 * (call['premium'] - put['premium']):.2f}
+ Stop Loss (×1): ${(call['premium'] - put['premium']):.2f}
 
-🔴 Sell PUT
-Instrument: {put['instrument']}
-Strike: {put['strike']}
-Mark Price: ${put['mark_price']:,.2f}
-Entry: ${put['entry']:,.2f} | Target: ${round(put['entry']*2, 2)} | SL: ${round(put['entry']*0.5, 2)}
+Isolated Strangle: Long Call, Short Put
+Risk‑Reward Ratio: 1:2
+"""
+    send_email("BTC Strangle from Lyra", body)
 
-🎯 Strategy: Long CALL + Short PUT (Strangle)
-RRR: 1:2
-        """
-    else:
-        subject = f"BTC Options Update – {datetime.utcnow().strftime('%Y-%m-%d')}"
-        body = "No suitable strangle setup found based on current filters."
-
-    print(f"Email Subject:\n{subject}")
-    print(f"Email Body:\n{body}")
-
-    send_email(subject, body)
-
-run_bot()
+if __name__ == "__main__":
+    run_bot()
