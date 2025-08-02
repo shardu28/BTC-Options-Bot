@@ -82,6 +82,23 @@ def get_ticker(instrument_name):
     except requests.RequestException as e:
         raise Exception(f"Network error while fetching ticker for {instrument_name}: {e}")
 
+def get_price(instrument_name):
+    ticker = get_ticker(instrument_name)
+
+    bid = ticker.get("best_bid", 0.0)
+    ask = ticker.get("best_ask", 0.0)
+    mark_price = ticker.get("mark_price", 0.0)
+
+    if bid and ask:
+        price = (bid + ask) / 2
+    elif mark_price:
+        price = mark_price
+    else:
+        price = 0.0
+
+    print(f"[DEBUG] {instrument_name} - Bid: {bid}, Ask: {ask}, Mark: {mark_price}, Used: {price}")
+    return round(price, 2)
+
 # --------------------------
 # Trade Logic
 # --------------------------
@@ -91,11 +108,9 @@ def select_best_strangle():
         index_price = get_index_price()
         instruments = get_options_instruments()
 
-        # Narrow down to nearest expiry
         nearest_expiry = min(set(i["expiration_timestamp"] for i in instruments))
         same_expiry = [i for i in instruments if i["expiration_timestamp"] == nearest_expiry]
 
-        # Find nearest ATM Call to BUY and OTM Put to SELL
         atm_call = None
         otm_put = None
         min_call_diff = float("inf")
@@ -117,19 +132,19 @@ def select_best_strangle():
                     otm_put = instr
 
         if atm_call and otm_put:
-            call_data = get_ticker(atm_call["instrument_name"])
-            put_data = get_ticker(otm_put["instrument_name"])
+            call_price = get_price(atm_call["instrument_name"])
+            put_price = get_price(otm_put["instrument_name"])
 
             return {
                 "call": {
                     "instrument": atm_call["instrument_name"],
                     "strike": atm_call["strike"],
-                    "price": call_data.get("mark_price", 0),
+                    "price": call_price,
                 },
                 "put": {
                     "instrument": otm_put["instrument_name"],
                     "strike": otm_put["strike"],
-                    "price": put_data.get("mark_price", 0),
+                    "price": put_price,
                 },
                 "index_price": index_price
             }
@@ -146,7 +161,7 @@ def select_best_strangle():
 def send_email(subject, body):
     msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
-    msg["To"] = SMTP_EMAIL
+    msg["To"] = SMTP_EMAIL  # Or RECIPIENT_EMAIL if needed
     msg["Subject"] = subject
 
     msg.attach(MIMEText(body, "plain"))
@@ -182,25 +197,19 @@ BTC Index Price: ${index:,.2f}
 Instrument: {call['instrument']}
 Strike: {call['strike']}
 Mark Price: ${call['price']:,.2f}
+Entry: ${call['price']:,.2f} | Target: ${round(call['price']*2, 2)} | SL: ${round(call['price']*0.5, 2)}
 
 🔴 Sell PUT
 Instrument: {put['instrument']}
 Strike: {put['strike']}
 Mark Price: ${put['price']:,.2f}
+Entry: ${put['price']:,.2f} | Target: ${round(put['price']*2, 2)} | SL: ${round(put['price']*0.5, 2)}
 
 🎯 Strategy: Long CALL + Short PUT (Strangle)
 RRR: 1:2
-Target Profit: ${round(call['price'] * 2, 2)}
-Stop Loss: ${round(call['price'] * 0.5, 2)}
-
-Manually place trades on Deribit.
         """
     else:
         subject = f"BTC Options Update – {datetime.utcnow().strftime('%Y-%m-%d')}"
         body = "No suitable strangle setup found based on current filters."
 
     send_email(subject, body)
-
-if __name__ == "__main__":
-    run_bot()
-
