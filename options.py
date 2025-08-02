@@ -161,7 +161,7 @@ def select_best_strangle():
 def send_email(subject, body):
     msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
-    msg["To"] = SMTP_EMAIL  # Or RECIPIENT_EMAIL if needed
+    msg["To"] = RECIPIENT_EMAIL  # Or RECIPIENT_EMAIL if needed
     msg["Subject"] = subject
 
     msg.attach(MIMEText(body, "plain"))
@@ -213,4 +213,5 @@ RRR: 1:2
         body = "No suitable strangle setup found based on current filters."
 
     send_email(subject, body)
+
 
