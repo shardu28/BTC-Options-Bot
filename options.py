@@ -214,7 +214,12 @@ RRR: 1:2
         subject = f"BTC Options Update – {datetime.utcnow().strftime('%Y-%m-%d')}"
         body = "No suitable strangle setup found based on current filters."
 
+    # 🔍 Add logging here
+    print(f"Email Subject:\n{subject}")
+    print(f"Email Body:\n{body}")
+
     send_email(subject, body)
+
 
 
 
