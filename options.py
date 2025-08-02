@@ -161,21 +161,25 @@ def select_best_strangle():
 def send_email(subject, body):
     SMTP_EMAIL = os.getenv("SMTP_EMAIL")
     SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-    RECIPIENT_EMAIL = SMTP_EMAIL  # Send to yourself
+    RECIPIENT_EMAIL = SMTP_EMAIL  # Sending to self
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
+    msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
     msg["To"] = RECIPIENT_EMAIL
-    msg.set_content(body)
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(body, "plain"))
 
     try:
-        print(f"Sending email from {SMTP_EMAIL} to {RECIPIENT_EMAIL}")
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
+        print(f"Sending email from {SMTP_EMAIL} to {RECIPIENT_EMAIL}...")
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
         print("✅ Email sent successfully.")
     except Exception as e:
+        print(f"❌ Email send failed: {e}")
         print(f"❌ Failed to send email: {e}")
 
 # --------------------------
@@ -215,6 +219,7 @@ RRR: 1:2
         body = "No suitable strangle setup found based on current filters."
 
     send_email(subject, body)
+
 
 
 
