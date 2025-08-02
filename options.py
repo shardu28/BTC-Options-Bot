@@ -8,11 +8,11 @@ from datetime import datetime
 
 # Load credentials from .env
 load_dotenv()
-CLIENT_ID = os.getenv("DERIBIT_CLIENT_ID")
-CLIENT_SECRET = os.getenv("DERIBIT_CLIENT_SECRET")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+RECIPIENT_EMAIL = os.getenv("SMTP_EMAIL")
 
 DERIBIT_BASE_URL = "https://www.deribit.com"
 
@@ -213,3 +213,4 @@ RRR: 1:2
         body = "No suitable strangle setup found based on current filters."
 
     send_email(subject, body)
+
