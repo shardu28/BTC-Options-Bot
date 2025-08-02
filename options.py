@@ -146,7 +146,7 @@ def select_best_strangle():
 def send_email(subject, body):
     msg = MIMEMultipart()
     msg["From"] = SMTP_EMAIL
-    msg["To"] = RECIPIENT_EMAIL
+    msg["To"] = SMTP_EMAIL
     msg["Subject"] = subject
 
     msg.attach(MIMEText(body, "plain"))
@@ -203,3 +203,4 @@ Manually place trades on Deribit.
 
 if __name__ == "__main__":
     run_bot()
+
