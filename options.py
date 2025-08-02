@@ -95,8 +95,7 @@ def get_price(instrument_name):
     else:
         price = 0.0
 
-    print(f"[DEBUG] {instrument_name} - Bid: {bid}, Ask: {ask}, Mark: {mark_price}, Used: {price}")
-    return round(price, 2)
+    return round(price, 2), round(mark_price, 2)
 
 # --------------------------
 # Trade Logic
@@ -107,8 +106,15 @@ def select_best_strangle():
         index_price = get_index_price()
         instruments = get_options_instruments()
 
-        nearest_expiry = min(set(i["expiration_timestamp"] for i in instruments))
-        same_expiry = [i for i in instruments if i["expiration_timestamp"] == nearest_expiry]
+        # Filter out dead options (no bid/ask/mark price)
+        live_instruments = []
+        for instr in instruments:
+            ticker = get_ticker(instr["instrument_name"])
+            if ticker.get("mark_price") or (ticker.get("best_bid") and ticker.get("best_ask")):
+                live_instruments.append(instr)
+
+        nearest_expiry = min(set(i["expiration_timestamp"] for i in live_instruments))
+        same_expiry = [i for i in live_instruments if i["expiration_timestamp"] == nearest_expiry]
 
         atm_call = None
         otm_put = None
@@ -131,19 +137,21 @@ def select_best_strangle():
                     otm_put = instr
 
         if atm_call and otm_put:
-            call_price = get_price(atm_call["instrument_name"])
-            put_price = get_price(otm_put["instrument_name"])
+            call_entry, call_mark = get_price(atm_call["instrument_name"])
+            put_entry, put_mark = get_price(otm_put["instrument_name"])
 
             return {
                 "call": {
                     "instrument": atm_call["instrument_name"],
                     "strike": atm_call["strike"],
-                    "price": call_price,
+                    "entry": call_entry,
+                    "mark_price": call_mark,
                 },
                 "put": {
                     "instrument": otm_put["instrument_name"],
                     "strike": otm_put["strike"],
-                    "price": put_price,
+                    "entry": put_entry,
+                    "mark_price": put_mark,
                 },
                 "index_price": index_price
             }
@@ -158,11 +166,6 @@ def select_best_strangle():
 # --------------------------
 
 def send_email(subject, body):
-    import os
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    import smtplib
-
     SMTP_EMAIL = os.getenv("SMTP_EMAIL")
     SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
@@ -208,14 +211,14 @@ BTC Index Price: ${index:,.2f}
 🟢 Buy CALL
 Instrument: {call['instrument']}
 Strike: {call['strike']}
-Mark Price: ${call['price']:,.2f}
-Entry: ${call['price']:,.2f} | Target: ${round(call['price']*2, 2)} | SL: ${round(call['price']*0.5, 2)}
+Mark Price: ${call['mark_price']:,.2f}
+Entry: ${call['entry']:,.2f} | Target: ${round(call['entry']*2, 2)} | SL: ${round(call['entry']*0.5, 2)}
 
 🔴 Sell PUT
 Instrument: {put['instrument']}
 Strike: {put['strike']}
-Mark Price: ${put['price']:,.2f}
-Entry: ${put['price']:,.2f} | Target: ${round(put['price']*2, 2)} | SL: ${round(put['price']*0.5, 2)}
+Mark Price: ${put['mark_price']:,.2f}
+Entry: ${put['entry']:,.2f} | Target: ${round(put['entry']*2, 2)} | SL: ${round(put['entry']*0.5, 2)}
 
 🎯 Strategy: Long CALL + Short PUT (Strangle)
 RRR: 1:2
@@ -224,17 +227,9 @@ RRR: 1:2
         subject = f"BTC Options Update – {datetime.utcnow().strftime('%Y-%m-%d')}"
         body = "No suitable strangle setup found based on current filters."
 
-    # 🔍 Add logging here
     print(f"Email Subject:\n{subject}")
     print(f"Email Body:\n{body}")
 
     send_email(subject, body)
+
 run_bot()
-
-
-
-
-
-
-
-
