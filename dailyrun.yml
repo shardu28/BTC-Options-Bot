@@ -2,7 +2,7 @@ name: Run BTC Options Bot Daily
 
 on:
   schedule:
-    - cron: '0 11 * * *'  # Runs daily at 1:00 PM UTC (6:30 PM IST)
+    - cron: '0 12 * * *'  # Runs daily at 1:00 PM UTC (6:30 PM IST)
   workflow_dispatch:  # Optional manual trigger
 
 jobs:
