@@ -9,6 +9,9 @@ import pandas as pd
 from pydantic import BaseModel, Field, validator
 from datetime import datetime
 import logging
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # -----------------------------
 # Logging
@@ -118,15 +121,109 @@ def fetch_eth_options():
 def to_dataframe(items):
     rows = []
     for it in items:
+        # Derive side (Call/Put) from symbol
+        side = None
+        if "C" in it.symbol:
+            side = "CALL"
+        elif "P" in it.symbol:
+            side = "PUT"
+
+        # Try to extract expiry date (assuming DDMMMYY format in symbol)
+        expiry_date = None
+        parts = it.symbol.split("-")
+        if len(parts) >= 3:
+            try:
+                expiry_date = datetime.strptime(parts[1], "%d%b%y").date()
+            except:
+                expiry_date = None
+
+        bid = it.quotes.best_bid if it.quotes else None
+        ask = it.quotes.best_ask if it.quotes else None
+
+        # Attempt to get OI and Spot — log warning if missing
+        oi_val = getattr(it, "oi", None)
+        if oi_val is None:
+            log.warning(f"Open Interest missing for {it.symbol}")
+
+        spot_val = getattr(it, "spot_price", None)
+        if spot_val is None:
+            log.warning(f"Spot price missing for {it.symbol}")
+
         rows.append({
             "symbol": it.symbol,
+            "side": side,
             "strike": it.strike_price,
-            "bid": it.quotes.best_bid if it.quotes else None,
-            "ask": it.quotes.best_ask if it.quotes else None,
-            "delta": it.greeks.delta if it.greeks else None,
+            "expiry_date": expiry_date,
+            "bid": bid,
+            "ask": ask,
+            "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
             "iv": it.greeks.iv if it.greeks else None,
+            "delta": it.greeks.delta if it.greeks else None,
+            "oi": oi_val,
+            "spot": spot_val
         })
     return pd.DataFrame(rows)
+
+# -----------------------------
+# Filter for email report
+# -----------------------------
+def filter_options(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    # Remove rows with missing critical fields
+    df = df.dropna(subset=["strike", "delta", "oi", "spot"])
+
+    spot_price = df['spot'].mean()
+    lower_strike = spot_price * 0.9
+    upper_strike = spot_price * 1.1
+
+    filtered = df[
+        (df['oi'] > 500) &
+        (df['delta'].abs().between(0.3, 0.7)) &
+        (df['strike'].between(lower_strike, upper_strike))
+    ]
+
+    return filtered.sort_values(['expiry_date', 'strike', 'side'])
+
+# -----------------------------
+# Email sending
+# -----------------------------
+def send_email_report(df: pd.DataFrame):
+    smtp_email = os.environ.get("SMTP_EMAIL")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    if not smtp_email or not smtp_password:
+        log.error("SMTP credentials not found.")
+        return
+    filtered_df = filter_options(df)
+    if filtered_df.empty:
+        log.warning("No options match filter. No email sent.")
+        return
+    html_table = filtered_df.to_html(
+        index=False,
+        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi"],
+        justify="center"
+    )
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Filtered ETH Options Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+    msg["From"] = smtp_email
+    msg["To"] = smtp_email
+    body = f"""
+    <html>
+      <body>
+        <p>Here is your filtered ETH options report:</p>
+        {html_table}
+      </body>
+    </html>
+    """
+    msg.attach(MIMEText(body, "html"))
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_email, smtp_password)
+            server.sendmail(smtp_email, smtp_email, msg.as_string())
+        log.info("Email report sent successfully.")
+    except Exception as e:
+        log.error(f"Failed to send email: {e}")
 
 # -----------------------------
 # Main
@@ -140,3 +237,4 @@ if __name__ == "__main__":
     else:
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
+    send_email_report(df)
