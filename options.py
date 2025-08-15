@@ -1,12 +1,12 @@
 """
-Delta India – ETH Options Data Extractor (with OI & Spot Price enrichment)
+Delta India – ETH Options Data Extractor (Phase 1, GitHub Actions Ready)
 """
 
 import os
 import time
 import requests
 import pandas as pd
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 import logging
 import smtplib
@@ -26,12 +26,15 @@ log = logging.getLogger("delta-eth-options")
 # Environment Variables (Secrets)
 # -----------------------------
 API_KEY = os.getenv("DELTA_INDIA_API_KEY")
-API_SECRET = os.getenv("DELTA_INDIA_API_SECRETE")
+API_SECRET = os.getenv("DELTA_INDIA_API_SECRETE")  # stored for later use
 
 BASE_URL = "https://api.india.delta.exchange"
 TIMEOUT = 15
 RETRIES = 3
-SLEEP_BETWEEN = 0.4
+SLEEP_BETWEEN = 0.6
+
+if not API_KEY:
+    log.warning("⚠️ No API key found in environment — public endpoints will still work but may be rate-limited.")
 
 # -----------------------------
 # Pydantic Models
@@ -40,7 +43,7 @@ class Quotes(BaseModel):
     best_bid: float | None = Field(None)
     best_ask: float | None = Field(None)
 
-    @validator("best_bid", "best_ask", pre=True)
+    @field_validator("best_bid", "best_ask", mode="before")
     def to_float(cls, v):
         try:
             return float(v) if v is not None else None
@@ -49,9 +52,13 @@ class Quotes(BaseModel):
 
 class Greeks(BaseModel):
     delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    rho: float | None = None
     iv: float | None = Field(None)
 
-    @validator("*", pre=True)
+    @field_validator("*", mode="before")
     def to_float(cls, v):
         try:
             return float(v) if v is not None else None
@@ -63,6 +70,8 @@ class TickerItem(BaseModel):
     strike_price: float | None = None
     quotes: Quotes | None = None
     greeks: Greeks | None = None
+    spot_price: float | None = None
+    open_interest: float | None = None
 
 # -----------------------------
 # HTTP GET helper
@@ -109,56 +118,55 @@ def fetch_eth_options():
     return items
 
 # -----------------------------
-# Fetch Spot Price
-# -----------------------------
-def fetch_spot_price():
-    raw = _get("/v2/underlying-assets", {"symbol": "ETH"})
-    assets = raw.get("result", [])
-    if assets and isinstance(assets, list):
-        return assets[0].get("spot_price")
-    return None
-
-# -----------------------------
-# Fetch Open Interest for all symbols
-# -----------------------------
-def fetch_open_interest(symbols):
-    oi_map = {}
-    for sym in symbols:
-        try:
-            raw = _get("/v2/open-interest", {"symbol": sym})
-            data = raw.get("result", {})
-            oi_map[sym] = data.get("open_interest")
-        except Exception as e:
-            log.debug(f"OI fetch failed for {sym}: {e}")
-            oi_map[sym] = None
-        time.sleep(SLEEP_BETWEEN)
-    return oi_map
-
-# -----------------------------
-# Convert to DataFrame and Enrich
+# Convert to DataFrame
 # -----------------------------
 def to_dataframe(items):
-    df = pd.DataFrame([{
-        "symbol": it.symbol,
-        "side": "CALL" if it.symbol.startswith("C") else "PUT" if it.symbol.startswith("P") else None,
-        "strike": it.strike_price,
-        "expiry_date": datetime.strptime(it.symbol.split("-")[-1], "%d%b%y").date() if len(it.symbol.split("-")) >= 3 else None,
-        "bid": it.quotes.best_bid if it.quotes else None,
-        "ask": it.quotes.best_ask if it.quotes else None,
-        "mid": (it.quotes.best_bid + it.quotes.best_ask) / 2 if it.quotes and it.quotes.best_bid is not None and it.quotes.best_ask is not None else None,
-        "iv": it.greeks.iv if it.greeks else None,
-        "delta": it.greeks.delta if it.greeks else None
-    } for it in items])
+    rows = []
+    for it in items:
+        # Derive side from symbol
+        side = None
+        if it.symbol.startswith("C-"):
+            side = "CALL"
+        elif it.symbol.startswith("P-"):
+            side = "PUT"
 
-    # Enrich with Spot price
-    spot_price = fetch_spot_price()
-    df["spot"] = spot_price
+        # Expiry date parsing fix
+        expiry_date = None
+        expiry_str = it.symbol.split("-")[-1]
+        try:
+            if expiry_str.isdigit():  # e.g., 260925
+                expiry_date = datetime.strptime(expiry_str, "%d%m%y").date()
+            else:  # e.g., 26SEP25
+                expiry_date = datetime.strptime(expiry_str.upper(), "%d%b%y").date()
+        except:
+            expiry_date = None
 
-    # Enrich with OI
-    oi_map = fetch_open_interest(df["symbol"].tolist())
-    df["oi"] = df["symbol"].map(oi_map)
+        bid = it.quotes.best_bid if it.quotes else None
+        ask = it.quotes.best_ask if it.quotes else None
 
-    return df
+        # Pull OI and Spot from API response fields
+        oi_val = getattr(it, "open_interest", None)
+        if oi_val is None:
+            log.warning(f"Open Interest missing for {it.symbol}")
+
+        spot_val = getattr(it, "spot_price", None)
+        if spot_val is None:
+            log.warning(f"Spot price missing for {it.symbol}")
+
+        rows.append({
+            "symbol": it.symbol,
+            "side": side,
+            "strike": it.strike_price,
+            "expiry_date": expiry_date,
+            "bid": bid,
+            "ask": ask,
+            "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
+            "iv": it.greeks.iv if it.greeks else None,
+            "delta": it.greeks.delta if it.greeks else None,
+            "oi": oi_val,
+            "spot": spot_val
+        })
+    return pd.DataFrame(rows)
 
 # -----------------------------
 # Filter for email report
@@ -166,10 +174,12 @@ def to_dataframe(items):
 def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+
     df = df.dropna(subset=["strike", "delta", "oi", "spot"])
     spot_price = df['spot'].mean()
     lower_strike = spot_price * 0.9
     upper_strike = spot_price * 1.1
+
     filtered = df[
         (df['oi'] > 500) &
         (df['delta'].abs().between(0.3, 0.7)) &
@@ -192,14 +202,21 @@ def send_email_report(df: pd.DataFrame):
         return
     html_table = filtered_df.to_html(
         index=False,
-        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi", "spot"],
+        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi"],
         justify="center"
     )
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Filtered ETH Options Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
     msg["From"] = smtp_email
     msg["To"] = smtp_email
-    body = f"<html><body><p>Here is your filtered ETH options report:</p>{html_table}</body></html>"
+    body = f"""
+    <html>
+      <body>
+        <p>Here is your filtered ETH options report:</p>
+        {html_table}
+      </body>
+    </html>
+    """
     msg.attach(MIMEText(body, "html"))
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
