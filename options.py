@@ -66,6 +66,7 @@ class Greeks(BaseModel):
             return None
 
 class TickerItem(BaseModel):
+    product_id: int | None = None
     symbol: str
     strike_price: float | None = None
     quotes: Quotes | None = None
@@ -119,15 +120,19 @@ def fetch_eth_options():
     return items
 
 # -----------------------------
-# Enrich options with expiry, OI, and spot price
+# Enrich with OI, Spot, Expiry
 # -----------------------------
 def enrich_eth_options(items):
     try:
-        raw_products = _get("/v2/products", {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"})
+        raw_products = _get("/v2/products", {
+            "contract_types": "call_options,put_options",
+            "underlying_asset_symbols": "ETH"
+        })
         products = raw_products.get("result", raw_products)
 
+        # Map by product_id
         product_map = {
-            p.get("symbol"): {
+            p.get("id"): {
                 "expiry_date": p.get("settlement_time", None),
                 "oi": p.get("open_interest", None),
                 "spot": p.get("spot_price", None),
@@ -136,10 +141,10 @@ def enrich_eth_options(items):
         }
 
         for it in items:
-            extra = product_map.get(it.symbol, {})
-            it.expiry_date = extra.get("expiry_date")
-            it.oi = extra.get("oi")
-            it.spot = extra.get("spot")
+            prod_info = product_map.get(it.product_id, {})
+            it.expiry_date = prod_info.get("expiry_date")
+            it.oi = prod_info.get("oi")
+            it.spot = prod_info.get("spot")
 
         log.info("Enrichment complete: expiry, OI, spot price added.")
         return items
@@ -153,7 +158,13 @@ def enrich_eth_options(items):
 def to_dataframe(items):
     rows = []
     for it in items:
-        side = "CALL" if it.symbol.startswith("C") else "PUT" if it.symbol.startswith("P") else None
+        # Derive side from symbol
+        side = None
+        if "-C-" in it.symbol:
+            side = "CALL"
+        elif "-P-" in it.symbol:
+            side = "PUT"
+
         bid = it.quotes.best_bid if it.quotes else None
         ask = it.quotes.best_ask if it.quotes else None
 
@@ -162,11 +173,18 @@ def to_dataframe(items):
         if it.spot is None:
             log.warning(f"Spot price missing for {it.symbol}")
 
+        expiry_date_fmt = None
+        if it.expiry_date:
+            try:
+                expiry_date_fmt = datetime.strptime(it.expiry_date, "%Y-%m-%dT%H:%M:%S%z").date()
+            except:
+                expiry_date_fmt = None
+
         rows.append({
             "symbol": it.symbol,
             "side": side,
             "strike": it.strike_price,
-            "expiry_date": it.expiry_date,
+            "expiry_date": expiry_date_fmt,
             "bid": bid,
             "ask": ask,
             "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
@@ -183,12 +201,10 @@ def to_dataframe(items):
 def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-
     df = df.dropna(subset=["strike", "delta", "oi", "spot"])
     spot_price = df['spot'].mean()
     lower_strike = spot_price * 0.9
     upper_strike = spot_price * 1.1
-
     filtered = df[
         (df['oi'] > 500) &
         (df['delta'].abs().between(0.3, 0.7)) &
@@ -240,7 +256,8 @@ def send_email_report(df: pd.DataFrame):
 # -----------------------------
 if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
-    items = enrich_eth_options(fetch_eth_options())  # <-- Enrich right after fetch
+    items = fetch_eth_options()
+    items = enrich_eth_options(items)
     df = to_dataframe(items)
     if df.empty:
         log.error("No data fetched!")
