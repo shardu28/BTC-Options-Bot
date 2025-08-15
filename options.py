@@ -116,7 +116,31 @@ def fetch_eth_options():
         except Exception as e:
             log.debug("Skipping malformed entry: %s", e)
     return items
+# -----------------------------
+# Fetch Spot Price
+# -----------------------------
+def fetch_spot_price():
+    raw = _get("/v2/underlying-assets", {"symbol": "ETH"})
+    assets = raw.get("result", [])
+    if assets and isinstance(assets, list):
+        return assets[0].get("spot_price")
+    return None
 
+# -----------------------------
+# Fetch Open Interest for all symbols
+# -----------------------------
+def fetch_open_interest(symbols):
+    oi_map = {}
+    for sym in symbols:
+        try:
+            raw = _get("/v2/open-interest", {"symbol": sym})
+            data = raw.get("result", {})
+            oi_map[sym] = data.get("open_interest")
+        except Exception as e:
+            log.debug(f"OI fetch failed for {sym}: {e}")
+            oi_map[sym] = None
+        time.sleep(SLEEP_BETWEEN)
+    return oi_map
 # -----------------------------
 # Convert to DataFrame
 # -----------------------------
@@ -239,3 +263,4 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
