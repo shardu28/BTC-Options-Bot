@@ -2,7 +2,8 @@ name: Run BTC Options Bot Daily
 
 on:
   schedule:
-    - cron: '30 13 * * *'  # Runs daily at 1:30 PM UTC (1 hour before US market opens)
+    # Runs daily at 7:30 AM EST (12:30 PM UTC)
+    - cron: '30 12 * * *'
   workflow_dispatch:  # Optional manual trigger
 
 jobs:
@@ -25,9 +26,9 @@ jobs:
 
       - name: Run options bot
         env:
-          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           DELTA_INDIA_API_KEY: ${{ secrets.DELTA_INDIA_API_KEY }}
           DELTA_INDIA_API_SECRETE: ${{ secrets.DELTA_INDIA_API_SECRETE }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: |
-          python options.py --expiry auto --save
+          python options.py
