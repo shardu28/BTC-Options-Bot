@@ -1,115 +1,142 @@
+"""
+Delta India – ETH Options Data Extractor (Phase 1, GitHub Actions Ready)
+"""
+
 import os
+import time
 import requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import pandas as pd
+from pydantic import BaseModel, Field, validator
+from datetime import datetime
+import logging
 
-load_dotenv()
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-DERIVATION = "BTC"  # or 'WBTC' if labeled
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(
+    level=os.environ.get("LOGLEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+)
+log = logging.getLogger("delta-eth-options")
 
-LYRA_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/lyra-finance/optimism-v2"
-GRAPHQL_QUERY = """
-query fetchOptions($market: String!) {
-  options(first: 200, where: {market: $market, openInterest_gt: 10}, orderBy: strikePrice, orderDirection: asc) {
-    id
-    strikePrice
-    expiryTimestamp
-    isCall
-    openInterest
-    impliedVolatility
-    delta
-    volume
-    premium
-    board { expiryTimestamp }
-  }
-}
-"""
+# -----------------------------
+# Environment Variables (Secrets)
+# -----------------------------
+API_KEY = os.getenv("DELTA_INDIA_API_KEY")
+API_SECRET = os.getenv("DELTA_INDIA_API_SECRETE")  # stored for later use
 
-def fetch_options(market="WBTC"):
-    resp = requests.post(LYRA_SUBGRAPH, json={'query': GRAPHQL_QUERY, 'variables': {'market': market}})
-    data = resp.json().get("data", {}).get("options", [])
-    return data
+BASE_URL = "https://api.india.delta.exchange"
+TIMEOUT = 15
+RETRIES = 3
+SLEEP_BETWEEN = 0.6
 
-def next_friday_ts():
-    today = datetime.utcnow().date()
-    fd = today + timedelta((4 - today.weekday()) % 7)
-    return int(datetime(fd.year, fd.month, fd.day, 0, 0).timestamp())
+if not API_KEY:
+    log.warning("⚠️ No API key found in environment — public endpoints will still work but may be rate-limited.")
 
-def select_strangle(opts):
-    target_expiry = next_friday_ts()
-    arr = [o for o in opts if o['expiryTimestamp'] == target_expiry]
-    if not arr: return None
+# -----------------------------
+# Pydantic Models
+# -----------------------------
+class Quotes(BaseModel):
+    best_bid: float | None = Field(None, alias="best_bid")
+    best_ask: float | None = Field(None, alias="best_ask")
 
-    calls = [o for o in arr if o['isCall'] and 0.3 <= o['delta'] <= 0.5]
-    puts = [o for o in arr if not o['isCall'] and -0.5 <= o['delta'] <= -0.3]
+    @validator("best_bid", "best_ask", pre=True)
+    def to_float(cls, v):
+        try:
+            return float(v) if v is not None else None
+        except:
+            return None
 
-    # sort by liquidity: openInterest × volume
-    calls.sort(key=lambda o: o['openInterest'] * o['volume'], reverse=True)
-    puts.sort(key=lambda o: o['openInterest'] * o['volume'], reverse=True)
-    if not calls or not puts: return None
+class Greeks(BaseModel):
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    rho: float | None = None
+    iv: float | None = Field(None, alias="iv")
 
-    call = calls[0]
-    put = next((p for p in puts if p['strikePrice'] < call['strikePrice']), puts[0])
+    @validator("*", pre=True)
+    def to_float(cls, v):
+        try:
+            return float(v) if v is not None else None
+        except:
+            return None
 
-    return call, put
+class TickerItem(BaseModel):
+    symbol: str
+    strike_price: float | None = None
+    quotes: Quotes | None = None
+    greeks: Greeks | None = None
 
-def send_email(subject, body):
-    if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print("❌ Missing SMTP credentials")
-        return
-    msg = MIMEMultipart()
-    msg["From"] = SMTP_EMAIL
-    msg["To"] = SMTP_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+# -----------------------------
+# HTTP GET helper
+# -----------------------------
+def _get(path: str, params: dict | None = None):
+    url = f"{BASE_URL}{path}"
+    headers = {"Accept": "application/json"}
+    if API_KEY:
+        headers["api-key"] = API_KEY
 
-    print(f"📤 Sending email from {SMTP_EMAIL}...")
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        print("✅ Email Sent.")
-    except Exception as e:
-        print("❌ Email error:", e)
+    last_err = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                last_err = f"HTTP {r.status_code}: {r.text}"
+                log.warning("Attempt %d failed: %s", attempt, last_err)
+        except Exception as e:
+            last_err = str(e)
+            log.warning("Attempt %d exception: %s", attempt, e)
+        time.sleep(SLEEP_BETWEEN)
+    raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
-def run_bot():
-    opts = fetch_options("WBTC")
-    out = select_strangle(opts)
-    if not out:
-        send_email("BTC Strangle Bot – No Trade", "No suitable setup found")
-        return
-    call, put = out
-    body = f"""
-💡 BTC Strangle Setup (Expiry Friday)
+# -----------------------------
+# Fetch ETH Option Chain
+# -----------------------------
+def fetch_eth_options():
+    params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
+    raw = _get("/v2/tickers", params)
+    result = raw.get("result", raw)
 
-📈 Buy Call: {call['id']}
- Strike: {call['strikePrice']}
- Premium: {call['premium']}
- IV: {call['impliedVolatility']:.3f}
- Delta: {call['delta']}
- OI×Vol: {call['openInterest']}×{call['volume']}
+    items = []
+    for entry in result:
+        try:
+            if "quotes" in entry:
+                entry["quotes"] = Quotes(**entry["quotes"])
+            if "greeks" in entry:
+                entry["greeks"] = Greeks(**entry["greeks"])
+            items.append(TickerItem(**entry))
+        except Exception as e:
+            log.debug("Skipping malformed entry: %s", e)
+    return items
 
-📉 Sell Put: {put['id']}
- Strike: {put['strikePrice']}
- Premium: {put['premium']}
- IV: {put['impliedVolatility']:.3f}
- Delta: {put['delta']}
- OI×Vol: {put['openInterest']}×{put['volume']}
+# -----------------------------
+# Convert to DataFrame
+# -----------------------------
+def to_dataframe(items):
+    rows = []
+    for it in items:
+        rows.append({
+            "symbol": it.symbol,
+            "strike": it.strike_price,
+            "bid": it.quotes.best_bid if it.quotes else None,
+            "ask": it.quotes.best_ask if it.quotes else None,
+            "delta": it.greeks.delta if it.greeks else None,
+            "iv": it.greeks.iv if it.greeks else None,
+        })
+    return pd.DataFrame(rows)
 
-🎯 Entry Spread: Call premium − Put premium = ${call['premium'] - put['premium']:.2f}
- Target (×2): ${2 * (call['premium'] - put['premium']):.2f}
- Stop Loss (×1): ${(call['premium'] - put['premium']):.2f}
-
-Isolated Strangle: Long Call, Short Put
-Risk‑Reward Ratio: 1:2
-"""
-    send_email("BTC Strangle from Lyra", body)
-
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
-    run_bot()
+    log.info("Fetching ETH options data from Delta Exchange India...")
+    items = fetch_eth_options()
+    df = to_dataframe(items)
+    if df.empty:
+        log.error("No data fetched!")
+    else:
+        log.info("Fetched %d contracts", len(df))
+        print(df.head(10))
