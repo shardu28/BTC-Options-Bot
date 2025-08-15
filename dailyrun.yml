@@ -22,7 +22,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dotenv pandas pydantic pytest
+          pip install requests python-dotenv pydantic pytest
+          pip install pandas
 
       - name: Run options bot
         env:
