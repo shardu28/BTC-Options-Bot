@@ -26,22 +26,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies from requirements.txt
+      - name: Install dependencies
         run: |
-          echo "=== Installing dependencies from requirements.txt ==="
-          if [ -f "requirements.txt" ]; then
-            echo "requirements.txt found in root."
-            python -m pip install --upgrade pip
-            pip install --no-cache-dir -r requirements.txt
-          elif [ -f "BTC-Options-Bot/requirements.txt" ]; then
-            echo "requirements.txt found in BTC-Options-Bot folder."
-            python -m pip install --upgrade pip
-            pip install --no-cache-dir -r BTC-Options-Bot/requirements.txt
-          else
-            echo "❌ requirements.txt not found!"
-            exit 1
-          fi
-          pip show pandas || { echo "❌ Pandas not installed!"; exit 1; }
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run options bot
         env:
