@@ -1,5 +1,5 @@
 """
-Delta India – ETH Options Data Extractor (Phase 1, GitHub Actions Ready)
+Delta India – ETH Options Data Extractor (with OI & Spot Price enrichment)
 """
 
 import os
@@ -26,22 +26,19 @@ log = logging.getLogger("delta-eth-options")
 # Environment Variables (Secrets)
 # -----------------------------
 API_KEY = os.getenv("DELTA_INDIA_API_KEY")
-API_SECRET = os.getenv("DELTA_INDIA_API_SECRETE")  # stored for later use
+API_SECRET = os.getenv("DELTA_INDIA_API_SECRETE")
 
 BASE_URL = "https://api.india.delta.exchange"
 TIMEOUT = 15
 RETRIES = 3
-SLEEP_BETWEEN = 0.6
-
-if not API_KEY:
-    log.warning("⚠️ No API key found in environment — public endpoints will still work but may be rate-limited.")
+SLEEP_BETWEEN = 0.4
 
 # -----------------------------
 # Pydantic Models
 # -----------------------------
 class Quotes(BaseModel):
-    best_bid: float | None = Field(None, alias="best_bid")
-    best_ask: float | None = Field(None, alias="best_ask")
+    best_bid: float | None = Field(None)
+    best_ask: float | None = Field(None)
 
     @validator("best_bid", "best_ask", pre=True)
     def to_float(cls, v):
@@ -52,11 +49,7 @@ class Quotes(BaseModel):
 
 class Greeks(BaseModel):
     delta: float | None = None
-    gamma: float | None = None
-    theta: float | None = None
-    vega: float | None = None
-    rho: float | None = None
-    iv: float | None = Field(None, alias="iv")
+    iv: float | None = Field(None)
 
     @validator("*", pre=True)
     def to_float(cls, v):
@@ -66,14 +59,10 @@ class Greeks(BaseModel):
             return None
 
 class TickerItem(BaseModel):
-    product_id: int | None = None
     symbol: str
     strike_price: float | None = None
     quotes: Quotes | None = None
     greeks: Greeks | None = None
-    expiry_date: str | None = None
-    oi: float | None = None
-    spot: float | None = None
 
 # -----------------------------
 # HTTP GET helper
@@ -120,80 +109,56 @@ def fetch_eth_options():
     return items
 
 # -----------------------------
-# Enrich with OI, Spot, Expiry
+# Fetch Spot Price
 # -----------------------------
-def enrich_eth_options(items):
-    try:
-        raw_products = _get("/v2/products", {
-            "contract_types": "call_options,put_options",
-            "underlying_asset_symbols": "ETH"
-        })
-        products = raw_products.get("result", raw_products)
-
-        # Map by product_id
-        product_map = {
-            p.get("id"): {
-                "expiry_date": p.get("settlement_time", None),
-                "oi": p.get("open_interest", None),
-                "spot": p.get("spot_price", None),
-            }
-            for p in products
-        }
-
-        for it in items:
-            prod_info = product_map.get(it.product_id, {})
-            it.expiry_date = prod_info.get("expiry_date")
-            it.oi = prod_info.get("oi")
-            it.spot = prod_info.get("spot")
-
-        log.info("Enrichment complete: expiry, OI, spot price added.")
-        return items
-    except Exception as e:
-        log.error(f"Failed to enrich options data: {e}")
-        return items
+def fetch_spot_price():
+    raw = _get("/v2/underlying-assets", {"symbol": "ETH"})
+    assets = raw.get("result", [])
+    if assets and isinstance(assets, list):
+        return assets[0].get("spot_price")
+    return None
 
 # -----------------------------
-# Convert to DataFrame
+# Fetch Open Interest for all symbols
+# -----------------------------
+def fetch_open_interest(symbols):
+    oi_map = {}
+    for sym in symbols:
+        try:
+            raw = _get("/v2/open-interest", {"symbol": sym})
+            data = raw.get("result", {})
+            oi_map[sym] = data.get("open_interest")
+        except Exception as e:
+            log.debug(f"OI fetch failed for {sym}: {e}")
+            oi_map[sym] = None
+        time.sleep(SLEEP_BETWEEN)
+    return oi_map
+
+# -----------------------------
+# Convert to DataFrame and Enrich
 # -----------------------------
 def to_dataframe(items):
-    rows = []
-    for it in items:
-        # Derive side from symbol
-        side = None
-        if "-C-" in it.symbol:
-            side = "CALL"
-        elif "-P-" in it.symbol:
-            side = "PUT"
+    df = pd.DataFrame([{
+        "symbol": it.symbol,
+        "side": "CALL" if it.symbol.startswith("C") else "PUT" if it.symbol.startswith("P") else None,
+        "strike": it.strike_price,
+        "expiry_date": datetime.strptime(it.symbol.split("-")[-1], "%d%b%y").date() if len(it.symbol.split("-")) >= 3 else None,
+        "bid": it.quotes.best_bid if it.quotes else None,
+        "ask": it.quotes.best_ask if it.quotes else None,
+        "mid": (it.quotes.best_bid + it.quotes.best_ask) / 2 if it.quotes and it.quotes.best_bid is not None and it.quotes.best_ask is not None else None,
+        "iv": it.greeks.iv if it.greeks else None,
+        "delta": it.greeks.delta if it.greeks else None
+    } for it in items])
 
-        bid = it.quotes.best_bid if it.quotes else None
-        ask = it.quotes.best_ask if it.quotes else None
+    # Enrich with Spot price
+    spot_price = fetch_spot_price()
+    df["spot"] = spot_price
 
-        if it.oi is None:
-            log.warning(f"Open Interest missing for {it.symbol}")
-        if it.spot is None:
-            log.warning(f"Spot price missing for {it.symbol}")
+    # Enrich with OI
+    oi_map = fetch_open_interest(df["symbol"].tolist())
+    df["oi"] = df["symbol"].map(oi_map)
 
-        expiry_date_fmt = None
-        if it.expiry_date:
-            try:
-                expiry_date_fmt = datetime.strptime(it.expiry_date, "%Y-%m-%dT%H:%M:%S%z").date()
-            except:
-                expiry_date_fmt = None
-
-        rows.append({
-            "symbol": it.symbol,
-            "side": side,
-            "strike": it.strike_price,
-            "expiry_date": expiry_date_fmt,
-            "bid": bid,
-            "ask": ask,
-            "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
-            "iv": it.greeks.iv if it.greeks else None,
-            "delta": it.greeks.delta if it.greeks else None,
-            "oi": it.oi,
-            "spot": it.spot
-        })
-    return pd.DataFrame(rows)
+    return df
 
 # -----------------------------
 # Filter for email report
@@ -227,21 +192,14 @@ def send_email_report(df: pd.DataFrame):
         return
     html_table = filtered_df.to_html(
         index=False,
-        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi"],
+        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi", "spot"],
         justify="center"
     )
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Filtered ETH Options Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
     msg["From"] = smtp_email
     msg["To"] = smtp_email
-    body = f"""
-    <html>
-      <body>
-        <p>Here is your filtered ETH options report:</p>
-        {html_table}
-      </body>
-    </html>
-    """
+    body = f"<html><body><p>Here is your filtered ETH options report:</p>{html_table}</body></html>"
     msg.attach(MIMEText(body, "html"))
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
@@ -257,7 +215,6 @@ def send_email_report(df: pd.DataFrame):
 if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
     items = fetch_eth_options()
-    items = enrich_eth_options(items)
     df = to_dataframe(items)
     if df.empty:
         log.error("No data fetched!")
