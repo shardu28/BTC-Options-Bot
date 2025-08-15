@@ -1,7 +1,4 @@
-requests
 pandas
+requests
 pydantic
 pytest
-
-
-
