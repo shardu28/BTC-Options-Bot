@@ -98,26 +98,57 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain (quotes, greeks, OI, spot)
+# Fetch ETH Option Chain (expiry-aware)
 # -----------------------------
 def fetch_eth_options():
+    # Step 1: fetch all tickers to discover expiries
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
     raw = _get("/v2/tickers", params)
     result = raw.get("result", raw)
 
-    items = []
+    # Extract available expiries
+    expiries = set()
     for entry in result:
+        sym = entry.get("symbol", "")
+        expiry_str = sym.split("-")[-1]
         try:
-            if "quotes" in entry:
-                entry["quotes"] = Quotes(**entry["quotes"])
-            if "greeks" in entry:
-                entry["greeks"] = Greeks(**entry["greeks"])
-            # ✅ capture OI + spot directly
-            entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
-            entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
-            items.append(TickerItem(**entry))
-        except Exception as e:
-            log.debug("Skipping malformed entry: %s", e)
+            if expiry_str.isdigit():
+                expiry_date = datetime.strptime(expiry_str, "%d%m%y").date()
+            else:
+                expiry_date = datetime.strptime(expiry_str.upper(), "%d%b%y").date()
+            expiries.add(expiry_date)
+        except:
+            continue
+
+    # Sort and keep 2 nearest
+    expiries = sorted(expiries)
+    keep_expiries = expiries[:2]
+    log.info(f"Fetching detailed data for expiries: {keep_expiries}")
+
+    items = []
+    # Step 2: call /tickers per expiry
+    for expiry in keep_expiries:
+        expiry_str = expiry.strftime("%d-%m-%Y")  # API expects DD-MM-YYYY
+        params = {
+            "contract_types": "call_options,put_options",
+            "underlying_asset_symbols": "ETH",
+            "expiry_date": expiry_str
+        }
+        raw = _get("/v2/tickers", params)
+        subset = raw.get("result", raw)
+
+        for entry in subset:
+            try:
+                if "quotes" in entry:
+                    entry["quotes"] = Quotes(**entry["quotes"])
+                if "greeks" in entry:
+                    entry["greeks"] = Greeks(**entry["greeks"])
+                entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
+                entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
+                items.append(TickerItem(**entry))
+            except Exception as e:
+                log.debug("Skipping malformed entry: %s", e)
+
     return items
 
 # -----------------------------
@@ -160,20 +191,7 @@ def to_dataframe(items):
             "oi": it.open_interest,
             "spot": it.spot_price
         })
-
-    df = pd.DataFrame(rows)
-
-    # -----------------------------
-    # 🔹 Expiry filtering logic
-    # -----------------------------
-    if not df.empty and "expiry_date" in df.columns:
-        unique_expiries = sorted(df["expiry_date"].dropna().unique())
-        if len(unique_expiries) >= 1:
-            keep_expiries = unique_expiries[:2]  # current + next expiry
-            df = df[df["expiry_date"].isin(keep_expiries)]
-            log.info(f"Keeping expiries: {keep_expiries}")
-
-    return df
+    return pd.DataFrame(rows)
 
 # -----------------------------
 # Filter for email report
