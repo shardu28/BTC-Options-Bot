@@ -1,11 +1,12 @@
 """
-Delta India – ETH Options Data Extractor (Phase 1, GitHub Actions Ready)
+Delta India – ETH Options Data Extractor (Phase 2: Insider Trader Logic Added)
 """
 
 import os
 import time
 import requests
 import pandas as pd
+import numpy as np
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 import logging
@@ -77,7 +78,7 @@ class TickerItem(BaseModel):
     greeks: Greeks | None = None
     spot_price: float | None = None
     open_interest: float | None = None
-    iv: float | None = None   # ✅ now added IV from mark_vol
+    iv: float | None = None   # ✅ IV from mark_vol
     volume: float | None = None  # ✅ 24h volume
 
 # -----------------------------
@@ -105,7 +106,7 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain (quotes, greeks, OI, spot, IV)
+# Fetch ETH Option Chain (quotes, greeks, OI, spot, IV, Volume)
 # -----------------------------
 def fetch_eth_options():
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
@@ -176,11 +177,15 @@ def to_dataframe(items):
             "bid": bid,
             "ask": ask,
             "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
-            "iv": it.iv,   # ✅ now pulling mark_vol
+            "iv": it.iv,
             "delta": it.greeks.delta if it.greeks else None,
+            "gamma": it.greeks.gamma if it.greeks else None,
+            "theta": it.greeks.theta if it.greeks else None,
+            "vega": it.greeks.vega if it.greeks else None,
+            "rho": it.greeks.rho if it.greeks else None,
             "oi": it.open_interest,
             "spot": it.spot_price,
-            "volume": it.volume  # ✅ include volume in DataFrame
+            "volume": it.volume
         })
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -188,7 +193,7 @@ def to_dataframe(items):
     return df
 
 # -----------------------------
-# Filter for email report
+# Standard Filter for Email Report
 # -----------------------------
 def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -198,17 +203,69 @@ def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     lower_strike = spot_price * 0.9
     upper_strike = spot_price * 1.1
 
-    cond_oi = df["oi_notional"] > 50000   # ✅ OI filter in USD notional
+    cond_oi = df["oi_notional"] > 50000
     cond_delta = df["delta"].abs().between(0.3, 0.7)
     cond_strike = df["strike"].between(lower_strike, upper_strike)
 
-    log.info(f"Spot price ~ {spot_price:.2f}, strike range = {lower_strike:.2f} - {upper_strike:.2f}")
-    log.info(f"Contracts passing OI>${50000}: {cond_oi.sum()}")
-    log.info(f"Contracts passing delta filter: {cond_delta.sum()}")
-    log.info(f"Contracts within strike range: {cond_strike.sum()}")
-
     filtered = df[cond_oi & cond_delta & cond_strike]
     return filtered.sort_values(['expiry_date', 'strike', 'side'])
+
+# -----------------------------
+# Insider Trader Strangle Selector
+# -----------------------------
+def select_strangles(df: pd.DataFrame):
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Ensure valid data
+    df = df.dropna(subset=["strike", "iv", "delta", "gamma", "theta", "vega", "rho", "volume"])
+
+    # ✅ IV percentile
+    df["iv_percentile"] = df["iv"].rank(pct=True) * 100
+
+    # Buy strangle filters
+    buy_calls = df[(df["side"] == "CALL") &
+                   (df["delta"].between(0.20, 0.30)) &
+                   (df["gamma"] >= 0.05) &
+                   (df["theta"].abs() <= 0.01) &
+                   (df["vega"] >= 0.10) &
+                   (df["rho"].abs() <= 0.05) &
+                   (df["iv_percentile"] <= 30) &
+                   (df["volume"] >= 200)]
+
+    buy_puts = df[(df["side"] == "PUT") &
+                  (df["delta"].between(-0.30, -0.20)) &
+                  (df["gamma"] >= 0.05) &
+                  (df["theta"].abs() <= 0.01) &
+                  (df["vega"] >= 0.10) &
+                  (df["rho"].abs() <= 0.05) &
+                  (df["iv_percentile"] <= 30) &
+                  (df["volume"] >= 200)]
+
+    # Sell strangle filters
+    sell_calls = df[(df["side"] == "CALL") &
+                    (df["delta"].between(0.20, 0.30)) &
+                    (df["gamma"] <= 0.02) &
+                    (df["theta"].abs() >= 0.03) &
+                    (df["vega"].between(0.05, 0.10)) &
+                    (df["rho"].abs() <= 0.05) &
+                    (df["iv_percentile"] >= 70) &
+                    (df["volume"] >= 200)]
+
+    sell_puts = df[(df["side"] == "PUT") &
+                   (df["delta"].between(-0.30, -0.20)) &
+                   (df["gamma"] <= 0.02) &
+                   (df["theta"].abs() >= 0.03) &
+                   (df["vega"].between(0.05, 0.10)) &
+                   (df["rho"].abs() <= 0.05) &
+                   (df["iv_percentile"] >= 70) &
+                   (df["volume"] >= 200)]
+
+    # Pair calls & puts
+    buy_strangles = pd.merge(buy_calls, buy_puts, on="expiry_date", suffixes=("_call", "_put"))
+    sell_strangles = pd.merge(sell_calls, sell_puts, on="expiry_date", suffixes=("_call", "_put"))
+
+    return buy_strangles, sell_strangles
 
 # -----------------------------
 # Email sending
@@ -219,28 +276,41 @@ def send_email_report(df: pd.DataFrame):
     if not smtp_email or not smtp_password:
         log.error("SMTP credentials not found.")
         return
+
     filtered_df = filter_options(df)
-    if filtered_df.empty:
+    buy_strangles, sell_strangles = select_strangles(df)
+
+    if filtered_df.empty and buy_strangles.empty and sell_strangles.empty:
         log.warning("No options match filter. No email sent.")
         return
-    html_table = filtered_df.to_html(
-        index=False,
-        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi", "oi_notional"],
-        justify="center"
-    )
+
+    html_parts = []
+
+    if not buy_strangles.empty or not sell_strangles.empty:
+        html_parts.append("<h3>🎯 Insider Trader Strangles</h3>")
+        if not buy_strangles.empty:
+            html_parts.append("<h4>Buy Strangles</h4>")
+            html_parts.append(buy_strangles.to_html(index=False))
+        if not sell_strangles.empty:
+            html_parts.append("<h4>Sell Strangles</h4>")
+            html_parts.append(sell_strangles.to_html(index=False))
+
+    if not filtered_df.empty:
+        html_parts.append("<h3>📊 Filtered ETH Options Report</h3>")
+        html_parts.append(filtered_df.to_html(
+            index=False,
+            columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi", "oi_notional"],
+            justify="center"
+        ))
+
+    body = f"<html><body>{''.join(html_parts)}</body></html>"
+
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Filtered ETH Options Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+    msg["Subject"] = f"ETH Options Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
     msg["From"] = smtp_email
     msg["To"] = smtp_email
-    body = f"""
-    <html>
-      <body>
-        <p>Here is your filtered ETH options report:</p>
-        {html_table}
-      </body>
-    </html>
-    """
     msg.attach(MIMEText(body, "html"))
+
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(smtp_email, smtp_password)
