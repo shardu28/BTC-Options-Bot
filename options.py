@@ -98,58 +98,47 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain (expiry-aware)
+# Fetch ETH Option Chain (bulk)
 # -----------------------------
 def fetch_eth_options():
-    # Step 1: fetch all tickers to discover expiries
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
     raw = _get("/v2/tickers", params)
     result = raw.get("result", raw)
 
-    # Extract available expiries
-    expiries = set()
-    for entry in result:
-        sym = entry.get("symbol", "")
-        expiry_str = sym.split("-")[-1]
-        try:
-            if expiry_str.isdigit():
-                expiry_date = datetime.strptime(expiry_str, "%d%m%y").date()
-            else:
-                expiry_date = datetime.strptime(expiry_str.upper(), "%d%b%y").date()
-            expiries.add(expiry_date)
-        except:
-            continue
-
-    # Sort and keep 2 nearest
-    expiries = sorted(expiries)
-    keep_expiries = expiries[:2]
-    log.info(f"Fetching detailed data for expiries: {keep_expiries}")
-
     items = []
-    # Step 2: call /tickers per expiry
-    for expiry in keep_expiries:
-        expiry_str = expiry.strftime("%d-%m-%Y")  # API expects DD-MM-YYYY
-        params = {
-            "contract_types": "call_options,put_options",
-            "underlying_asset_symbols": "ETH",
-            "expiry_date": expiry_str
-        }
-        raw = _get("/v2/tickers", params)
-        subset = raw.get("result", raw)
-
-        for entry in subset:
-            try:
-                if "quotes" in entry:
-                    entry["quotes"] = Quotes(**entry["quotes"])
-                if "greeks" in entry:
-                    entry["greeks"] = Greeks(**entry["greeks"])
-                entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
-                entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
-                items.append(TickerItem(**entry))
-            except Exception as e:
-                log.debug("Skipping malformed entry: %s", e)
-
+    for entry in result:
+        try:
+            if "quotes" in entry:
+                entry["quotes"] = Quotes(**entry["quotes"])
+            if "greeks" in entry:
+                entry["greeks"] = Greeks(**entry["greeks"])
+            entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
+            entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
+            items.append(TickerItem(**entry))
+        except Exception as e:
+            log.debug("Skipping malformed entry: %s", e)
     return items
+
+# -----------------------------
+# Enrich contracts with IV/Greeks
+# -----------------------------
+def enrich_with_iv(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = []
+    for _, row in df.iterrows():
+        try:
+            r = _get(f"/v2/tickers/{row['symbol']}", None)
+            result = r.get("result", {})
+            greeks = result.get("greeks", {})
+            iv_val = float(greeks.get("iv")) if greeks.get("iv") else None
+            delta_val = float(greeks.get("delta")) if greeks.get("delta") else row["delta"]
+            df.at[_, "iv"] = iv_val
+            df.at[_, "delta"] = delta_val
+            enriched.append(row["symbol"])
+            time.sleep(0.2)  # ✅ throttle politely
+        except Exception as e:
+            log.warning(f"Failed to enrich {row['symbol']}: {e}")
+    log.info(f"Enriched {len(enriched)} contracts with IV/Greeks")
+    return df
 
 # -----------------------------
 # Convert to DataFrame
@@ -157,20 +146,14 @@ def fetch_eth_options():
 def to_dataframe(items):
     rows = []
     for it in items:
-        # Derive side
-        side = None
-        if it.symbol.startswith("C-"):
-            side = "CALL"
-        elif it.symbol.startswith("P-"):
-            side = "PUT"
+        side = "CALL" if it.symbol.startswith("C-") else "PUT" if it.symbol.startswith("P-") else None
 
-        # Expiry date parsing fix
         expiry_date = None
         expiry_str = it.symbol.split("-")[-1]
         try:
-            if expiry_str.isdigit():  # e.g., 260925
+            if expiry_str.isdigit():
                 expiry_date = datetime.strptime(expiry_str, "%d%m%y").date()
-            else:  # e.g., 26SEP25
+            else:
                 expiry_date = datetime.strptime(expiry_str.upper(), "%d%b%y").date()
         except:
             expiry_date = None
@@ -256,9 +239,15 @@ if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
     items = fetch_eth_options()
     df = to_dataframe(items)
+
     if df.empty:
         log.error("No data fetched!")
     else:
         log.info("Fetched %d contracts", len(df))
+        # ✅ Enrich only relevant contracts (near spot, enough OI)
+        shortlist = filter_options(df)
+        if not shortlist.empty:
+            df = enrich_with_iv(shortlist)
         print(df.head(10))
+
     send_email_report(df)
