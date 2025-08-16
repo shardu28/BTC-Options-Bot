@@ -71,6 +71,7 @@ class TickerItem(BaseModel):
     quotes: Quotes | None = None
     greeks: Greeks | None = None
     spot_price: float | None = None
+    open_interest: float | None = None   # ✅ keep OI directly here
 
 # -----------------------------
 # HTTP GET helper
@@ -97,7 +98,7 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain (quotes, greeks, spot)
+# Fetch ETH Option Chain (quotes, greeks, OI, spot)
 # -----------------------------
 def fetch_eth_options():
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
@@ -111,7 +112,7 @@ def fetch_eth_options():
                 entry["quotes"] = Quotes(**entry["quotes"])
             if "greeks" in entry:
                 entry["greeks"] = Greeks(**entry["greeks"])
-            # 🔹 capture OI + spot directly from response
+            # ✅ capture OI + spot directly
             entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
             entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
             items.append(TickerItem(**entry))
@@ -146,15 +147,6 @@ def to_dataframe(items):
         bid = it.quotes.best_bid if it.quotes else None
         ask = it.quotes.best_ask if it.quotes else None
 
-        # Pull OI from contract map
-        oi_val = oi_map.get(it.symbol, None)
-        if oi_val is None:
-            log.warning(f"Open Interest missing for {it.symbol}")
-
-        spot_val = it.spot_price
-        if spot_val is None:
-            log.warning(f"Spot price missing for {it.symbol}")
-
         rows.append({
             "symbol": it.symbol,
             "side": side,
@@ -165,10 +157,23 @@ def to_dataframe(items):
             "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
             "iv": it.greeks.iv if it.greeks else None,
             "delta": it.greeks.delta if it.greeks else None,
-            "oi": oi_val,
-            "spot": spot_val
+            "oi": it.open_interest,
+            "spot": it.spot_price
         })
-    return pd.DataFrame(rows)
+
+    df = pd.DataFrame(rows)
+
+    # -----------------------------
+    # 🔹 Expiry filtering logic
+    # -----------------------------
+    if not df.empty and "expiry_date" in df.columns:
+        unique_expiries = sorted(df["expiry_date"].dropna().unique())
+        if len(unique_expiries) >= 1:
+            keep_expiries = unique_expiries[:2]  # current + next expiry
+            df = df[df["expiry_date"].isin(keep_expiries)]
+            log.info(f"Keeping expiries: {keep_expiries}")
+
+    return df
 
 # -----------------------------
 # Filter for email report
@@ -239,7 +244,3 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
-
-
-
-
