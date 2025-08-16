@@ -7,7 +7,7 @@ import time
 import requests
 import pandas as pd
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -42,8 +42,10 @@ if not API_KEY:
 class Quotes(BaseModel):
     best_bid: float | None = Field(None)
     best_ask: float | None = Field(None)
+    bid_iv: float | None = Field(None)
+    ask_iv: float | None = Field(None)
 
-    @field_validator("best_bid", "best_ask", mode="before")
+    @field_validator("*", mode="before")
     def to_float(cls, v):
         try:
             return float(v) if v is not None else None
@@ -56,7 +58,6 @@ class Greeks(BaseModel):
     theta: float | None = None
     vega: float | None = None
     rho: float | None = None
-    iv: float | None = Field(None)
 
     @field_validator("*", mode="before")
     def to_float(cls, v):
@@ -71,7 +72,7 @@ class TickerItem(BaseModel):
     quotes: Quotes | None = None
     greeks: Greeks | None = None
     spot_price: float | None = None
-    open_interest: float | None = None   # ✅ keep OI directly here
+    open_interest: float | None = None
 
 # -----------------------------
 # HTTP GET helper
@@ -98,7 +99,7 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain (bulk)
+# Fetch ETH Option Chain (quotes, greeks, OI, spot)
 # -----------------------------
 def fetch_eth_options():
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
@@ -120,46 +121,52 @@ def fetch_eth_options():
     return items
 
 # -----------------------------
-# Enrich contracts with IV/Greeks
-# -----------------------------
-def enrich_with_iv(df: pd.DataFrame) -> pd.DataFrame:
-    enriched = []
-    for _, row in df.iterrows():
-        try:
-            r = _get(f"/v2/tickers/{row['symbol']}", None)
-            result = r.get("result", {})
-            greeks = result.get("greeks", {})
-            iv_val = float(greeks.get("iv")) if greeks.get("iv") else None
-            delta_val = float(greeks.get("delta")) if greeks.get("delta") else row["delta"]
-            df.at[_, "iv"] = iv_val
-            df.at[_, "delta"] = delta_val
-            enriched.append(row["symbol"])
-            time.sleep(0.2)  # ✅ throttle politely
-        except Exception as e:
-            log.warning(f"Failed to enrich {row['symbol']}: {e}")
-    log.info(f"Enriched {len(enriched)} contracts with IV/Greeks")
-    return df
-
-# -----------------------------
 # Convert to DataFrame
 # -----------------------------
 def to_dataframe(items):
     rows = []
-    for it in items:
-        side = "CALL" if it.symbol.startswith("C-") else "PUT" if it.symbol.startswith("P-") else None
+    today = datetime.utcnow().date()
+    allowed_expiries = {today, today + timedelta(days=1)}
+    log.info("Keeping expiries: %s", list(allowed_expiries))
 
+    for it in items:
+        # Derive side
+        side = None
+        if it.symbol.startswith("C-"):
+            side = "CALL"
+        elif it.symbol.startswith("P-"):
+            side = "PUT"
+
+        # Expiry parsing
         expiry_date = None
         expiry_str = it.symbol.split("-")[-1]
         try:
-            if expiry_str.isdigit():
+            if expiry_str.isdigit():  # e.g. 260925
                 expiry_date = datetime.strptime(expiry_str, "%d%m%y").date()
-            else:
+            else:  # e.g. 26SEP25
                 expiry_date = datetime.strptime(expiry_str.upper(), "%d%b%y").date()
         except:
             expiry_date = None
 
+        if expiry_date not in allowed_expiries:
+            continue  # skip non-matching expiries
+
         bid = it.quotes.best_bid if it.quotes else None
         ask = it.quotes.best_ask if it.quotes else None
+
+        # ✅ IV calculation from bid_iv/ask_iv
+        bid_iv = it.quotes.bid_iv if it.quotes else None
+        ask_iv = it.quotes.ask_iv if it.quotes else None
+        iv = None
+        try:
+            if bid_iv is not None and ask_iv is not None:
+                iv = (bid_iv + ask_iv) / 2
+            elif bid_iv is not None:
+                iv = bid_iv
+            elif ask_iv is not None:
+                iv = ask_iv
+        except:
+            iv = None
 
         rows.append({
             "symbol": it.symbol,
@@ -169,7 +176,7 @@ def to_dataframe(items):
             "bid": bid,
             "ask": ask,
             "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
-            "iv": it.greeks.iv if it.greeks else None,
+            "iv": iv,
             "delta": it.greeks.delta if it.greeks else None,
             "oi": it.open_interest,
             "spot": it.spot_price
@@ -239,15 +246,9 @@ if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
     items = fetch_eth_options()
     df = to_dataframe(items)
-
     if df.empty:
         log.error("No data fetched!")
     else:
         log.info("Fetched %d contracts", len(df))
-        # ✅ Enrich only relevant contracts (near spot, enough OI)
-        shortlist = filter_options(df)
-        if not shortlist.empty:
-            df = enrich_with_iv(shortlist)
         print(df.head(10))
-
     send_email_report(df)
