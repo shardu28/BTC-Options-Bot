@@ -23,6 +23,12 @@ logging.basicConfig(
 log = logging.getLogger("delta-eth-options")
 
 # -----------------------------
+# Pandas display settings
+# -----------------------------
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
+# -----------------------------
 # Environment Variables (Secrets)
 # -----------------------------
 API_KEY = os.getenv("DELTA_INDIA_API_KEY")
@@ -167,7 +173,10 @@ def to_dataframe(items):
             "oi": it.open_interest,
             "spot": it.spot_price
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["oi_notional"] = df["oi"] * df["spot"]
+    return df
 
 # -----------------------------
 # Filter for email report
@@ -179,11 +188,17 @@ def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     spot_price = df['spot'].mean()
     lower_strike = spot_price * 0.9
     upper_strike = spot_price * 1.1
-    filtered = df[
-        (df['oi'] > 500) &
-        (df['delta'].abs().between(0.3, 0.7)) &
-        (df['strike'].between(lower_strike, upper_strike))
-    ]
+
+    cond_oi = df["oi_notional"] > 50000   # ✅ OI filter in USD notional
+    cond_delta = df["delta"].abs().between(0.3, 0.7)
+    cond_strike = df["strike"].between(lower_strike, upper_strike)
+
+    log.info(f"Spot price ~ {spot_price:.2f}, strike range = {lower_strike:.2f} - {upper_strike:.2f}")
+    log.info(f"Contracts passing OI>${50000}: {cond_oi.sum()}")
+    log.info(f"Contracts passing delta filter: {cond_delta.sum()}")
+    log.info(f"Contracts within strike range: {cond_strike.sum()}")
+
+    filtered = df[cond_oi & cond_delta & cond_strike]
     return filtered.sort_values(['expiry_date', 'strike', 'side'])
 
 # -----------------------------
@@ -201,7 +216,7 @@ def send_email_report(df: pd.DataFrame):
         return
     html_table = filtered_df.to_html(
         index=False,
-        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi"],
+        columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi", "oi_notional"],
         justify="center"
     )
     msg = MIMEMultipart("alternative")
