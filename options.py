@@ -111,33 +111,13 @@ def fetch_eth_options():
                 entry["quotes"] = Quotes(**entry["quotes"])
             if "greeks" in entry:
                 entry["greeks"] = Greeks(**entry["greeks"])
+            # 🔹 capture OI + spot directly from response
+            entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
+            entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
             items.append(TickerItem(**entry))
         except Exception as e:
             log.debug("Skipping malformed entry: %s", e)
     return items
-
-# -----------------------------
-# Fetch Open Interest from /v2/products (India cluster)
-# -----------------------------
-def fetch_open_interest():
-    params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
-    raw = _get("/v2/products", params)   # ✅ correct endpoint for India
-    products = raw.get("result", raw)
-
-    if products:
-        # Debug: log the first entry so we can confirm the OI field
-        log.info("Sample product JSON: %s", products[0])
-
-    oi_map = {}
-    for p in products:
-        sym = p.get("symbol")
-        # The actual OI key may vary (open_interest / oi / stats.open_interest)
-        oi_val = p.get("open_interest") or p.get("oi")
-        # If inside nested stats dict
-        if not oi_val and "stats" in p:
-            oi_val = p["stats"].get("open_interest")
-        oi_map[sym] = oi_val
-    return oi_map
 
 # -----------------------------
 # Convert to DataFrame
@@ -252,12 +232,13 @@ def send_email_report(df: pd.DataFrame):
 if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
     items = fetch_eth_options()
-    oi_map = fetch_open_interest()
-    df = to_dataframe(items, oi_map)
+    df = to_dataframe(items)
     if df.empty:
         log.error("No data fetched!")
     else:
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
+
 
