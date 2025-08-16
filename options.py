@@ -71,7 +71,6 @@ class TickerItem(BaseModel):
     quotes: Quotes | None = None
     greeks: Greeks | None = None
     spot_price: float | None = None
-    open_interest: float | None = None
 
 # -----------------------------
 # HTTP GET helper
@@ -98,7 +97,7 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain
+# Fetch ETH Option Chain (quotes, greeks, spot)
 # -----------------------------
 def fetch_eth_options():
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
@@ -116,38 +115,27 @@ def fetch_eth_options():
         except Exception as e:
             log.debug("Skipping malformed entry: %s", e)
     return items
-# -----------------------------
-# Fetch Spot Price
-# -----------------------------
-def fetch_spot_price():
-    raw = _get("/v2/underlying-assets", {"symbol": "ETH"})
-    assets = raw.get("result", [])
-    if assets and isinstance(assets, list):
-        return assets[0].get("spot_price")
-    return None
 
 # -----------------------------
-# Fetch Open Interest for all symbols
+# Fetch Open Interest from /v2/contracts
 # -----------------------------
-def fetch_open_interest(symbols):
+def fetch_open_interest():
+    params = {"underlying_asset_symbol": "ETH", "contract_types": "call_options,put_options"}
+    raw = _get("/v2/contracts", params)
+    contracts = raw.get("result", raw)
     oi_map = {}
-    for sym in symbols:
-        try:
-            raw = _get("/v2/open-interest", {"symbol": sym})
-            data = raw.get("result", {})
-            oi_map[sym] = data.get("open_interest")
-        except Exception as e:
-            log.debug(f"OI fetch failed for {sym}: {e}")
-            oi_map[sym] = None
-        time.sleep(SLEEP_BETWEEN)
+    for c in contracts:
+        sym = c.get("symbol")
+        oi_map[sym] = c.get("open_interest")
     return oi_map
+
 # -----------------------------
 # Convert to DataFrame
 # -----------------------------
-def to_dataframe(items):
+def to_dataframe(items, oi_map):
     rows = []
     for it in items:
-        # Derive side from symbol
+        # Derive side
         side = None
         if it.symbol.startswith("C-"):
             side = "CALL"
@@ -168,12 +156,12 @@ def to_dataframe(items):
         bid = it.quotes.best_bid if it.quotes else None
         ask = it.quotes.best_ask if it.quotes else None
 
-        # Pull OI and Spot from API response fields
-        oi_val = getattr(it, "open_interest", None)
+        # Pull OI from contract map
+        oi_val = oi_map.get(it.symbol, None)
         if oi_val is None:
             log.warning(f"Open Interest missing for {it.symbol}")
 
-        spot_val = getattr(it, "spot_price", None)
+        spot_val = it.spot_price
         if spot_val is None:
             log.warning(f"Spot price missing for {it.symbol}")
 
@@ -198,12 +186,10 @@ def to_dataframe(items):
 def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-
     df = df.dropna(subset=["strike", "delta", "oi", "spot"])
     spot_price = df['spot'].mean()
     lower_strike = spot_price * 0.9
     upper_strike = spot_price * 1.1
-
     filtered = df[
         (df['oi'] > 500) &
         (df['delta'].abs().between(0.3, 0.7)) &
@@ -256,23 +242,11 @@ def send_email_report(df: pd.DataFrame):
 if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
     items = fetch_eth_options()
-
-    # 🔹 New step: fetch OI for all option symbols
-    symbols = [it.symbol for it in items]
-    oi_map = fetch_open_interest(symbols)
-    for it in items:
-        if it.symbol in oi_map:
-            it.open_interest = oi_map[it.symbol]
-
-    df = to_dataframe(items)
-
+    oi_map = fetch_open_interest()
+    df = to_dataframe(items, oi_map)
     if df.empty:
         log.error("No data fetched!")
     else:
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
-
     send_email_report(df)
-
-
-
