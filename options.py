@@ -78,6 +78,7 @@ class TickerItem(BaseModel):
     spot_price: float | None = None
     open_interest: float | None = None
     iv: float | None = None   # ✅ now added IV from mark_vol
+    volume: float | None = None  # ✅ 24h volume
 
 # -----------------------------
 # HTTP GET helper
@@ -118,7 +119,7 @@ def fetch_eth_options():
                 entry["quotes"] = Quotes(**entry["quotes"])
             if "greeks" in entry:
                 entry["greeks"] = Greeks(**entry["greeks"])
-            # ✅ capture OI, Spot, and IV directly
+            # ✅ capture OI, Spot, IV, Volume directly
             entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
             entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
             iv_val = entry.get("mark_vol")
@@ -128,6 +129,13 @@ def fetch_eth_options():
                 except:
                     iv_val = None
             entry["iv"] = iv_val
+            vol_val = entry.get("volume")
+            if vol_val is not None:
+                try:
+                    vol_val = float(vol_val)
+                except:
+                    vol_val = None
+            entry["volume"] = vol_val
             items.append(TickerItem(**entry))
         except Exception as e:
             log.debug("Skipping malformed entry: %s", e)
@@ -171,7 +179,8 @@ def to_dataframe(items):
             "iv": it.iv,   # ✅ now pulling mark_vol
             "delta": it.greeks.delta if it.greeks else None,
             "oi": it.open_interest,
-            "spot": it.spot_price
+            "spot": it.spot_price,
+            "volume": it.volume  # ✅ include volume in DataFrame
         })
     df = pd.DataFrame(rows)
     if not df.empty:
