@@ -117,16 +117,26 @@ def fetch_eth_options():
     return items
 
 # -----------------------------
-# Fetch Open Interest from /v2/contracts
+# Fetch Open Interest from /v2/products (India cluster)
 # -----------------------------
 def fetch_open_interest():
-    params = {"underlying_asset_symbol": "ETH", "contract_types": "call_options,put_options"}
-    raw = _get("/v2/contracts", params)
-    contracts = raw.get("result", raw)
+    params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
+    raw = _get("/v2/products", params)   # ✅ correct endpoint for India
+    products = raw.get("result", raw)
+
+    if products:
+        # Debug: log the first entry so we can confirm the OI field
+        log.info("Sample product JSON: %s", products[0])
+
     oi_map = {}
-    for c in contracts:
-        sym = c.get("symbol")
-        oi_map[sym] = c.get("open_interest")
+    for p in products:
+        sym = p.get("symbol")
+        # The actual OI key may vary (open_interest / oi / stats.open_interest)
+        oi_val = p.get("open_interest") or p.get("oi")
+        # If inside nested stats dict
+        if not oi_val and "stats" in p:
+            oi_val = p["stats"].get("open_interest")
+        oi_map[sym] = oi_val
     return oi_map
 
 # -----------------------------
@@ -250,3 +260,4 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
