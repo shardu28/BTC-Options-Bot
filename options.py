@@ -256,11 +256,23 @@ def send_email_report(df: pd.DataFrame):
 if __name__ == "__main__":
     log.info("Fetching ETH options data from Delta Exchange India...")
     items = fetch_eth_options()
+
+    # 🔹 New step: fetch OI for all option symbols
+    symbols = [it.symbol for it in items]
+    oi_map = fetch_open_interest(symbols)
+    for it in items:
+        if it.symbol in oi_map:
+            it.open_interest = oi_map[it.symbol]
+
     df = to_dataframe(items)
+
     if df.empty:
         log.error("No data fetched!")
     else:
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
+
     send_email_report(df)
+
+
 
