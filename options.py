@@ -122,7 +122,7 @@ def fetch_eth_options():
 # -----------------------------
 # Convert to DataFrame
 # -----------------------------
-def to_dataframe(items, oi_map):
+def to_dataframe(items):
     rows = []
     for it in items:
         # Derive side
@@ -239,6 +239,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
