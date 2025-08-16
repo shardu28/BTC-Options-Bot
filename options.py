@@ -7,7 +7,7 @@ import time
 import requests
 import pandas as pd
 from pydantic import BaseModel, Field, field_validator
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -42,10 +42,8 @@ if not API_KEY:
 class Quotes(BaseModel):
     best_bid: float | None = Field(None)
     best_ask: float | None = Field(None)
-    bid_iv: float | None = Field(None)
-    ask_iv: float | None = Field(None)
 
-    @field_validator("*", mode="before")
+    @field_validator("best_bid", "best_ask", mode="before")
     def to_float(cls, v):
         try:
             return float(v) if v is not None else None
@@ -73,6 +71,7 @@ class TickerItem(BaseModel):
     greeks: Greeks | None = None
     spot_price: float | None = None
     open_interest: float | None = None
+    iv: float | None = None   # ✅ now added IV from mark_vol
 
 # -----------------------------
 # HTTP GET helper
@@ -99,7 +98,7 @@ def _get(path: str, params: dict | None = None):
     raise RuntimeError(f"GET failed after {RETRIES} attempts: {last_err}")
 
 # -----------------------------
-# Fetch ETH Option Chain (quotes, greeks, OI, spot)
+# Fetch ETH Option Chain (quotes, greeks, OI, spot, IV)
 # -----------------------------
 def fetch_eth_options():
     params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": "ETH"}
@@ -113,8 +112,16 @@ def fetch_eth_options():
                 entry["quotes"] = Quotes(**entry["quotes"])
             if "greeks" in entry:
                 entry["greeks"] = Greeks(**entry["greeks"])
+            # ✅ capture OI, Spot, and IV directly
             entry["open_interest"] = float(entry.get("oi")) if entry.get("oi") is not None else None
             entry["spot_price"] = float(entry.get("spot_price")) if entry.get("spot_price") is not None else None
+            iv_val = entry.get("mark_vol")
+            if iv_val is not None:
+                try:
+                    iv_val = float(iv_val)
+                except:
+                    iv_val = None
+            entry["iv"] = iv_val
             items.append(TickerItem(**entry))
         except Exception as e:
             log.debug("Skipping malformed entry: %s", e)
@@ -125,10 +132,6 @@ def fetch_eth_options():
 # -----------------------------
 def to_dataframe(items):
     rows = []
-    today = datetime.utcnow().date()
-    allowed_expiries = {today, today + timedelta(days=1)}
-    log.info("Keeping expiries: %s", list(allowed_expiries))
-
     for it in items:
         # Derive side
         side = None
@@ -137,36 +140,19 @@ def to_dataframe(items):
         elif it.symbol.startswith("P-"):
             side = "PUT"
 
-        # Expiry parsing
+        # Expiry date parsing fix
         expiry_date = None
         expiry_str = it.symbol.split("-")[-1]
         try:
-            if expiry_str.isdigit():  # e.g. 260925
+            if expiry_str.isdigit():  # e.g., 260925
                 expiry_date = datetime.strptime(expiry_str, "%d%m%y").date()
-            else:  # e.g. 26SEP25
+            else:  # e.g., 26SEP25
                 expiry_date = datetime.strptime(expiry_str.upper(), "%d%b%y").date()
         except:
             expiry_date = None
 
-        if expiry_date not in allowed_expiries:
-            continue  # skip non-matching expiries
-
         bid = it.quotes.best_bid if it.quotes else None
         ask = it.quotes.best_ask if it.quotes else None
-
-        # ✅ IV calculation from bid_iv/ask_iv
-        bid_iv = it.quotes.bid_iv if it.quotes else None
-        ask_iv = it.quotes.ask_iv if it.quotes else None
-        iv = None
-        try:
-            if bid_iv is not None and ask_iv is not None:
-                iv = (bid_iv + ask_iv) / 2
-            elif bid_iv is not None:
-                iv = bid_iv
-            elif ask_iv is not None:
-                iv = ask_iv
-        except:
-            iv = None
 
         rows.append({
             "symbol": it.symbol,
@@ -176,7 +162,7 @@ def to_dataframe(items):
             "bid": bid,
             "ask": ask,
             "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
-            "iv": iv,
+            "iv": it.iv,   # ✅ now pulling mark_vol
             "delta": it.greeks.delta if it.greeks else None,
             "oi": it.open_interest,
             "spot": it.spot_price
