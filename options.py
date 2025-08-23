@@ -201,6 +201,9 @@ def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     
     df = df.dropna(subset=["strike", "delta", "oi", "spot", "volume", "iv"])
     spot_price = df['spot'].mean()
+
+    # Ensure expiry_date is datetime
+    df["expiry_date"] = pd.to_datetime(df["expiry_date"])
     
     # Range tighter around spot (±5%)
     lower_strike = spot_price * 0.95
@@ -631,5 +634,6 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
