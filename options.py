@@ -277,9 +277,9 @@ def select_strangles(
             (df["volume"] >= 20) &
             (df["spread_pct"] <= 3.4) &  # slightly relaxed from 2.0
             (df["delta"].abs().between(0.10, 0.60)) &
-            (df.get("vega", 0).abs() >= 0.025) &
-            (df.get("theta", 0).abs() <= 0.12) &
-            (df.get("gamma", 0).abs() >= 0.004) &
+            (df.get("vega", 0).abs().between(0.5, 5)) &
+            (df.get("theta", 0).abs() <= 8) &
+            (df.get("gamma", 0).abs().between(0.0002, 0.005)) &
             (df["iv"] > 0)
         ].copy()
 
@@ -650,6 +650,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
