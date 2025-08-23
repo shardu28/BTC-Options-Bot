@@ -273,13 +273,13 @@ def select_strangles(
     else:
         # --- Fallback: if no RV data, enforce Greeks + liquidity filters (slightly relaxed) ---
         df = df[
-            (df["oi"] >= 80) &
+            (df["oi"] >= 50) &
             (df["volume"] >= 20) &
-            (df["spread_pct"] <= 3.2) &  # slightly relaxed from 2.0
-            (df["delta"].abs().between(0.15, 0.55)) &
-            (df.get("vega", 0).abs() >= 0.027) &
-            (df.get("theta", 0).abs() <= 0.11) &
-            (df.get("gamma", 0).abs() >= 0.005) &
+            (df["spread_pct"] <= 3.4) &  # slightly relaxed from 2.0
+            (df["delta"].abs().between(0.10, 0.60)) &
+            (df.get("vega", 0).abs() >= 0.025) &
+            (df.get("theta", 0).abs() <= 0.12) &
+            (df.get("gamma", 0).abs() >= 0.004) &
             (df["iv"] > 0)
         ].copy()
 
@@ -291,7 +291,7 @@ def select_strangles(
     GF = {
         "expiry_dte_min": 2,
         "expiry_dte_max": 7,
-        "min_open_interest": 80,
+        "min_open_interest": 50,
         "min_volume": 20,
         "max_bid_ask_spread_pct": 3.0,
         "max_slippage_pct_per_leg": 10.0,  # informational (we use spread_pct as proxy)
@@ -650,6 +650,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
