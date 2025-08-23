@@ -198,77 +198,341 @@ def to_dataframe(items):
 def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    df = df.dropna(subset=["strike", "delta", "oi", "spot"])
+    
+    df = df.dropna(subset=["strike", "delta", "oi", "spot", "volume", "iv"])
     spot_price = df['spot'].mean()
-    lower_strike = spot_price * 0.9
-    upper_strike = spot_price * 1.1
+    
+    # Range tighter around spot (±5%)
+    lower_strike = spot_price * 0.95
+    upper_strike = spot_price * 1.05
 
-    cond_oi = df["oi_notional"] > 50000
-    cond_delta = df["delta"].abs().between(0.3, 0.7)
+    # Global filters from JSON
+    cond_dte = (df['expiry_date'] - pd.Timestamp.today().date()).dt.days.between(2, 7)
+    cond_oi = df["oi"] >= 100
+    cond_vol = df["volume"] >= 20
     cond_strike = df["strike"].between(lower_strike, upper_strike)
 
-    filtered = df[cond_oi & cond_delta & cond_strike]
+    filtered = df[cond_dte & cond_oi & cond_vol & cond_strike]
     return filtered.sort_values(['expiry_date', 'strike', 'side'])
 
 # -----------------------------
-# Insider Trader Strangle Selector
+# Insider Trader Strategy Selector (JSON -> Python)
 # -----------------------------
-def select_strangles(df: pd.DataFrame):
+def select_strangles(
+    df: pd.DataFrame,
+    *,
+    iv_rank_pct: float | None = None,     # 0-100 (if None, computed from chain IV)
+    iv_30d: float | None = None,          # e.g., 0.65 for 65% (optional but enables expected-move constraints)
+    rv_7d: float | None = None,           # realized vol (0.xx) - optional
+    rv_14d: float | None = None,          # realized vol (0.xx) - optional
+    event_risk_level: str = "low",        # "low" | "medium" | "high"
+    directional_bias: str = "neutral"     # "bullish" | "bearish" | "neutral"
+):
+    """
+    Returns a dict with the selected strategy and legs, or {"strategy": "no_trade"} if nothing qualifies.
+    This function does NOT mutate the data pipeline and only consumes the df produced by to_dataframe().
+    """
+
+    result = {"strategy": "no_trade", "reason": "No qualifying trade found."}
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        result["reason"] = "Empty dataframe"
+        return result
 
-    # Ensure valid data
-    df = df.dropna(subset=["strike", "iv", "delta", "gamma", "theta", "vega", "rho", "volume"])
+    # --- Safety: Clean, compute helpers ---
+    # Must-have fields for filters
+    df = df.copy()
+    df = df.dropna(subset=["expiry_date", "side", "strike", "bid", "ask", "mid", "delta", "oi", "volume", "iv", "spot"])
 
-    # ✅ IV percentile
-    df["iv_percentile"] = df["iv"].rank(pct=True) * 100
+    # Compute DTE
+    today = datetime.utcnow().date()
+    df["dte"] = (pd.to_datetime(df["expiry_date"]).dt.date - today).apply(lambda d: d.days if pd.notnull(d) else None)
 
-    # Buy strangle filters
-    buy_calls = df[(df["side"] == "CALL") &
-                   (df["delta"].between(0.20, 0.30)) &
-                   (df["gamma"] >= 0.05) &
-                   (df["theta"].abs() <= 0.01) &
-                   (df["vega"] >= 0.10) &
-                   (df["rho"].abs() <= 0.05) &
-                   (df["iv_percentile"] <= 30) &
-                   (df["volume"] >= 200)]
+    # Bid-ask spread pct
+    df["spread_pct"] = ((df["ask"] - df["bid"]) / df["mid"].replace(0, np.nan)) * 100
 
-    buy_puts = df[(df["side"] == "PUT") &
-                  (df["delta"].between(-0.30, -0.20)) &
-                  (df["gamma"] >= 0.05) &
-                  (df["theta"].abs() <= 0.01) &
-                  (df["vega"] >= 0.10) &
-                  (df["rho"].abs() <= 0.05) &
-                  (df["iv_percentile"] <= 30) &
-                  (df["volume"] >= 200)]
+    # IV rank %: if not supplied, compute from current chain IV
+    if iv_rank_pct is None:
+        # Percentile rank of current IV among all contract IVs
+        chain_iv_pct = df["iv"].rank(pct=True).mean() * 100
+        iv_rank_pct = float(np.clip(chain_iv_pct, 0, 100))
 
-    # Sell strangle filters
-    sell_calls = df[(df["side"] == "CALL") &
-                    (df["delta"].between(0.20, 0.30)) &
-                    (df["gamma"] <= 0.02) &
-                    (df["theta"].abs() >= 0.03) &
-                    (df["vega"].between(0.05, 0.10)) &
-                    (df["rho"].abs() <= 0.05) &
-                    (df["iv_percentile"] >= 70) &
-                    (df["volume"] >= 200)]
+    # Spot from chain if not provided
+    spot = float(df["spot"].mean())
 
-    sell_puts = df[(df["side"] == "PUT") &
-                   (df["delta"].between(-0.30, -0.20)) &
-                   (df["gamma"] <= 0.02) &
-                   (df["theta"].abs() >= 0.03) &
-                   (df["vega"].between(0.05, 0.10)) &
-                   (df["rho"].abs() <= 0.05) &
-                   (df["iv_percentile"] >= 70) &
-                   (df["volume"] >= 200)]
+    # Blended RV if both exist; else fall back gently
+    blended_rv = None
+    if rv_7d is not None and rv_14d is not None:
+        blended_rv = (rv_7d + rv_14d) / 2.0
+    elif rv_7d is not None:
+        blended_rv = rv_7d
+    elif rv_14d is not None:
+        blended_rv = rv_14d
 
-    # Pair calls & puts
-    buy_strangles = pd.merge(buy_calls, buy_puts, on="expiry_date", suffixes=("_call", "_put"))
-    sell_strangles = pd.merge(sell_calls, sell_puts, on="expiry_date", suffixes=("_call", "_put"))
+    # --- Global Filters from JSON ---
+    GF = {
+        "expiry_dte_min": 2,
+        "expiry_dte_max": 7,
+        "min_open_interest": 100,
+        "min_volume": 20,
+        "max_bid_ask_spread_pct": 2.0,
+        "max_slippage_pct_per_leg": 10.0,  # informational (we use spread_pct as proxy)
+    }
 
-    return buy_strangles, sell_strangles
+    base = df[
+        (df["dte"] >= GF["expiry_dte_min"]) &
+        (df["dte"] <= GF["expiry_dte_max"]) &
+        (df["oi"] >= GF["min_open_interest"]) &
+        (df["volume"] >= GF["min_volume"]) &
+        (df["spread_pct"] <= GF["max_bid_ask_spread_pct"])
+    ].copy()
 
+    if base.empty:
+        result["reason"] = "No contracts left after global filters"
+        return result
+
+    # --- Decision Layer ---
+    def choose_strategy():
+        cheap_iv = (iv_rank_pct <= 35)
+        high_iv  = (iv_rank_pct >= 50)
+
+        iv_vs_rv_ok_long = None
+        iv_vs_rv_ok_short = None
+        if iv_30d is not None and blended_rv is not None and blended_rv > 0:
+            ratio = iv_30d / blended_rv
+            iv_vs_rv_ok_long = (ratio <= 1.0)
+            iv_vs_rv_ok_short = (ratio >= 1.2)
+        else:
+            # If RV missing, rely only on IV rank
+            iv_vs_rv_ok_long = True if cheap_iv else False
+            iv_vs_rv_ok_short = True if high_iv else False
+
+        if event_risk_level in ["medium", "high"] and (cheap_iv or iv_vs_rv_ok_long):
+            return "long_strangle"
+        if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
+            return "short_strangle"
+        if (iv_rank_pct <= 30) and (iv_vs_rv_ok_long or cheap_iv) and directional_bias == "bullish":
+            return "long_call"
+        return "no_trade"
+
+    strategy = choose_strategy()
+    result["decision_metrics"] = {
+        "spot": spot,
+        "iv_rank_pct": iv_rank_pct,
+        "iv_30d": iv_30d,
+        "rv_7d": rv_7d,
+        "rv_14d": rv_14d,
+        "blended_rv": blended_rv,
+        "event_risk_level": event_risk_level,
+        "directional_bias": directional_bias,
+        "chosen": strategy,
+    }
+
+    if strategy == "no_trade":
+        result["strategy"] = "no_trade"
+        result["reason"] = "Decision layer selected no_trade"
+        return result
+
+    # --- Strike selection helpers ---
+    def expected_move_band(row):
+        """Return True if strike deviation fits expected move band when iv_30d is given."""
+        if iv_30d is None:
+            return True  # no constraint if IV30 not provided
+        em = spot * iv_30d * np.sqrt(max(row["dte"], 1) / 365.0)  # expected move
+        dev = abs(row["strike"] - spot)
+        return (dev >= em * 1.0) and (dev <= em * 1.5)
+
+    # Short strangle selection
+    if strategy == "short_strangle":
+        SS = {
+            "delta_abs_min": 0.10,
+            "delta_abs_max": 0.15,
+            "net_position_delta_limit": 0.05,
+            "min_net_credit_usd": 50,
+        }
+        calls = base[(base["side"] == "CALL") &
+                     (base["delta"].between(SS["delta_abs_min"], SS["delta_abs_max"]))].copy()
+        puts  = base[(base["side"] == "PUT") &
+                     (base["delta"].between(-SS["delta_abs_max"], -SS["delta_abs_min"]))].copy()
+
+        if iv_30d is not None:
+            calls = calls[calls.apply(expected_move_band, axis=1)]
+            puts  = puts[puts.apply(expected_move_band, axis=1)]
+
+        if calls.empty or puts.empty:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No legs in delta/EM band for short strangle"
+            return result
+
+        # Pair by same expiry, enforce net delta cap and score by credit and tight spreads
+        pairs = []
+        for exp in sorted(set(calls["expiry_date"]).intersection(set(puts["expiry_date"]))):
+            c = calls[calls["expiry_date"] == exp]
+            p = puts[puts["expiry_date"] == exp]
+            if c.empty or p.empty:
+                continue
+            # greedy match: take best by score
+            for _, rc in c.iterrows():
+                # choose put that keeps net delta smallest
+                p["net_delta"] = (rc["delta"] + p["delta"].values)
+                candidates = p[p["net_delta"].abs() <= SS["net_position_delta_limit"]].copy()
+                if candidates.empty:
+                    continue
+                candidates["credit"] = rc["mid"] + candidates["mid"]
+                candidates["score"] = candidates["credit"] - 0.1*(rc["spread_pct"] + candidates["spread_pct"]) - 10*candidates["net_delta"].abs()
+                best = candidates.sort_values("score", ascending=False).head(1)
+                if not best.empty:
+                    pairs.append((rc, best.iloc[0]))
+
+        if not pairs:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No call-put pairs satisfy net Δ cap"
+            return result
+
+        # Pick best pair with min credit
+        best_pair = None
+        best_score = -1e9
+        for rc, rp in pairs:
+            credit = rc["mid"] + rp["mid"]
+            if credit < SS["min_net_credit_usd"]:
+                continue
+            score = credit - 0.1*(rc["spread_pct"] + rp["spread_pct"])
+            if score > best_score:
+                best_score = score
+                best_pair = (rc, rp, credit)
+
+        if best_pair is None:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No pair meets minimum net credit"
+            return result
+
+        rc, rp, credit = best_pair
+        result["strategy"] = "short_strangle"
+        result["expiry"] = str(rc["expiry_date"])
+        result["legs"] = [
+            {"action": "SELL", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
+             "delta": float(rc["delta"]), "bid": float(rc["bid"]), "ask": float(rc["ask"]), "mid": float(rc["mid"])},
+            {"action": "SELL", "type": "PUT",  "symbol": rp["symbol"], "strike": float(rp["strike"]),
+             "delta": float(rp["delta"]), "bid": float(rp["bid"]), "ask": float(rp["ask"]), "mid": float(rp["mid"])}
+        ]
+        result["entry"] = {
+            "order_type": "limit",
+            "price_basis": "sum_of_mids",
+            "net_credit_usd": float(round(credit, 2))
+        }
+        # OCO exits
+        tp_debit = round(credit * 0.50, 2)
+        sl_debit = round(credit * 3.00, 2)
+        result["exits"] = {
+            "take_profit_combo_buy_debit": tp_debit,
+            "stop_loss_combo_buy_debit": sl_debit,
+            "delta_stop_threshold": 0.20,
+            "touch_exit": True,
+            "time_exit_hours": 24
+        }
+        result["used_rows"] = pd.DataFrame([rc, rp])
+
+        return result
+
+    # Long strangle selection
+    if strategy == "long_strangle":
+        LS = {
+            "delta_abs_min": 0.25,
+            "delta_abs_max": 0.35,
+        }
+        calls = base[(base["side"] == "CALL") &
+                     (base["delta"].between(LS["delta_abs_min"], LS["delta_abs_max"]))].copy()
+        puts  = base[(base["side"] == "PUT") &
+                     (base["delta"].between(-LS["delta_abs_max"], -LS["delta_abs_min"]))].copy()
+
+        if calls.empty or puts.empty:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No legs in delta band for long strangle"
+            return result
+
+        pairs = []
+        for exp in sorted(set(calls["expiry_date"]).intersection(set(puts["expiry_date"]))):
+            c = calls[calls["expiry_date"] == exp]
+            p = puts[puts["expiry_date"] == exp]
+            if c.empty or p.empty:
+                continue
+            for _, rc in c.iterrows():
+                cand = p.copy()
+                cand["debit"] = rc["mid"] + cand["mid"]
+                # prefer bigger vega exposure per dollar
+                cand["score"] = ((rc.get("vega", 0) + cand.get("vega", 0)) / cand["debit"].replace(0, np.nan))
+                best = cand.sort_values("score", ascending=False).head(1)
+                if not best.empty:
+                    pairs.append((rc, best.iloc[0]))
+
+        if not pairs:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No call-put pairs for long strangle"
+            return result
+
+        # Choose best by score
+        scores = [((rc.get("vega", 0) + rp.get("vega", 0)) / max(rc["mid"] + rp["mid"], 1e-9)) for rc, rp in [(p[0], p[1]) for p in pairs]]
+        idx = int(np.argmax(scores))
+        rc, rp = pairs[idx]
+        debit = float(round(rc["mid"] + rp["mid"], 2))
+
+        result["strategy"] = "long_strangle"
+        result["expiry"] = str(rc["expiry_date"])
+        result["legs"] = [
+            {"action": "BUY", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
+             "delta": float(rc["delta"]), "bid": float(rc["bid"]), "ask": float(rc["ask"]), "mid": float(rc["mid"])},
+            {"action": "BUY",  "type": "PUT",  "symbol": rp["symbol"], "strike": float(rp["strike"]),
+             "delta": float(rp["delta"]), "bid": float(rp["bid"]), "ask": float(rp["ask"]), "mid": float(rp["mid"])}
+        ]
+        # Entry (limit, sum of mids); exits per JSON
+        result["entry"] = {"order_type": "limit", "price_basis": "sum_of_mids", "net_debit_usd": debit}
+        result["exits"] = {
+            "take_profit_combo_sell_primary": round(debit * 1.50, 2),
+            "take_profit_combo_sell_secondary": round(debit * 2.00, 2),
+            "take_profit_combo_sell_runner": round(debit * 3.00, 2),
+            "stop_loss_combo_sell": round(debit * 0.50, 2),
+            "time_exit_hours": 24
+        }
+        result["used_rows"] = pd.DataFrame([rc, rp])
+        return result
+
+    # Long call selection
+    if strategy == "long_call":
+        LC = {"call_delta_min": 0.30, "call_delta_max": 0.45}
+        calls = base[(base["side"] == "CALL") &
+                     (base["delta"].between(LC["call_delta_min"], LC["call_delta_max"]))].copy()
+        if calls.empty:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No calls in delta band for long_call"
+            return result
+
+        # prefer high vega / $ and tight spread
+        calls["score"] = (calls.get("vega", 0) / calls["mid"].replace(0, np.nan)) - 0.05*calls["spread_pct"]
+        rc = calls.sort_values("score", ascending=False).head(1).iloc[0]
+        debit = float(round(rc["mid"], 2))
+
+        result["strategy"] = "long_call"
+        result["expiry"] = str(rc["expiry_date"])
+        result["legs"] = [
+            {"action": "BUY", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
+             "delta": float(rc["delta"]), "bid": float(rc["bid"]), "ask": float(rc["ask"]), "mid": float(rc["mid"])}
+        ]
+        result["entry"] = {"order_type": "limit", "price_basis": "mid", "net_debit_usd": debit}
+        result["exits"] = {
+            "take_profit_sell_primary": round(debit * 1.50, 2),
+            "take_profit_sell_secondary": round(debit * 2.00, 2),
+            "stop_loss_sell": round(debit * 0.50, 2),
+            "time_exit_hours": 24
+        }
+        result["used_rows"] = pd.DataFrame([rc])
+        return result
+
+    # Fallback
+    result["strategy"] = "no_trade"
+    result["reason"] = "Unhandled branch"
+    return result
+    
 # -----------------------------
-# Email sending
+# Email sending (trade ticket only)
 # -----------------------------
 def send_email_report(df: pd.DataFrame):
     smtp_email = os.environ.get("SMTP_EMAIL")
@@ -277,36 +541,57 @@ def send_email_report(df: pd.DataFrame):
         log.error("SMTP credentials not found.")
         return
 
-    filtered_df = filter_options(df)
-    buy_strangles, sell_strangles = select_strangles(df)
+    # >>> Provide contextual inputs here (wire your own values if you have RV & IV30).
+    # Safe defaults: uses chain-derived iv_rank if iv_rank_pct=None; blended_rv optional.
+    trade = select_strangles(
+        df,
+        iv_rank_pct=None,        # if you have your own daily IV rank, pass it here (0-100)
+        iv_30d=None,            # pass your 30d IV (e.g., 0.65) to enable expected-move banding
+        rv_7d=None,             # realized vol inputs optional
+        rv_14d=None,
+        event_risk_level="low", # set externally if there is an ETH catalyst ("low"|"medium"|"high")
+        directional_bias="neutral"
+    )
 
-    if filtered_df.empty and buy_strangles.empty and sell_strangles.empty:
-        log.warning("No options match filter. No email sent.")
-        return
+    if trade.get("strategy") == "no_trade":
+        log.warning("No trade selected: %s", trade.get("reason"))
+        subject = f"ETH Options – No Trade ({datetime.utcnow().strftime('%Y-%m-%d')})"
+        body = f"""
+        <html><body>
+        <h3>No Trade Selected</h3>
+        <p>Reason: {trade.get('reason','')}</p>
+        <pre>{trade.get('decision_metrics')}</pre>
+        </body></html>
+        """
+    else:
+        # small legs table
+        used = trade.get("used_rows", pd.DataFrame())
+        legs_html = ""
+        if not used.empty:
+            legs_html = used[[
+                "symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "delta", "volume", "oi", "spread_pct"
+            ]].to_html(index=False, justify="center", float_format=lambda x: f"{x:.4f}" if isinstance(x, float) else x)
 
-    html_parts = []
-
-    if not buy_strangles.empty or not sell_strangles.empty:
-        html_parts.append("<h3>🎯 Insider Trader Strangles</h3>")
-        if not buy_strangles.empty:
-            html_parts.append("<h4>Buy Strangles</h4>")
-            html_parts.append(buy_strangles.to_html(index=False))
-        if not sell_strangles.empty:
-            html_parts.append("<h4>Sell Strangles</h4>")
-            html_parts.append(sell_strangles.to_html(index=False))
-
-    if not filtered_df.empty:
-        html_parts.append("<h3>📊 Filtered ETH Options Report</h3>")
-        html_parts.append(filtered_df.to_html(
-            index=False,
-            columns=["symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "iv", "delta", "oi", "oi_notional"],
-            justify="center"
-        ))
-
-    body = f"<html><body>{''.join(html_parts)}</body></html>"
+        dm = trade.get("decision_metrics", {})
+        subject = f"ETH {trade['strategy'].replace('_',' ').title()} – {trade.get('expiry','')} ({datetime.utcnow().strftime('%Y-%m-%d')})"
+        body = f"""
+        <html><body>
+          <h2>🎯 Strategy: {trade['strategy'].replace('_',' ').title()}</h2>
+          <p><b>Spot</b>: {dm.get('spot')}</p>
+          <p><b>Decision Inputs</b>:
+             IV Rank %={dm.get('iv_rank_pct')}, IV30={dm.get('iv_30d')}, RV7={dm.get('rv_7d')}, RV14={dm.get('rv_14d')},
+             Event={dm.get('event_risk_level')}, Bias={dm.get('directional_bias')}</p>
+          <h3>Legs</h3>
+          {legs_html}
+          <h3>Entry</h3>
+          <pre>{trade.get('entry')}</pre>
+          <h3>Exits / Risk</h3>
+          <pre>{trade.get('exits')}</pre>
+        </body></html>
+        """
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"ETH Options Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+    msg["Subject"] = subject
     msg["From"] = smtp_email
     msg["To"] = smtp_email
     msg.attach(MIMEText(body, "html"))
@@ -332,3 +617,4 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
