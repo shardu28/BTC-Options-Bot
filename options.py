@@ -209,8 +209,8 @@ def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     lower_strike = spot_price * 0.95
     upper_strike = spot_price * 1.05
 
-    # Global filters from JSON
-    cond_dte = (df['expiry_date'] - pd.Timestamp.today().date()).dt.days.between(2, 7)
+    # Compute days to expiry (fix: use Timestamp.today(), not .date())
+    cond_dte = (df['expiry_date'] - pd.Timestamp.today()).dt.days.between(2, 7)
     cond_oi = df["oi"] >= 100
     cond_vol = df["volume"] >= 20
     cond_strike = df["strike"].between(lower_strike, upper_strike)
@@ -634,6 +634,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
