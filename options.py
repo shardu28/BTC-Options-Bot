@@ -532,7 +532,7 @@ def select_strangles(
     return result
     
 # -----------------------------
-# Email sending (trade ticket only)
+# Email sending (trade ticket + snapshot table)
 # -----------------------------
 def send_email_report(df: pd.DataFrame):
     smtp_email = os.environ.get("SMTP_EMAIL")
@@ -541,36 +541,48 @@ def send_email_report(df: pd.DataFrame):
         log.error("SMTP credentials not found.")
         return
 
-    # >>> Provide contextual inputs here (wire your own values if you have RV & IV30).
-    # Safe defaults: uses chain-derived iv_rank if iv_rank_pct=None; blended_rv optional.
+    # --- Strategy selection ---
     trade = select_strangles(
         df,
-        iv_rank_pct=None,        # if you have your own daily IV rank, pass it here (0-100)
-        iv_30d=None,            # pass your 30d IV (e.g., 0.65) to enable expected-move banding
-        rv_7d=None,             # realized vol inputs optional
+        iv_rank_pct=None,
+        iv_30d=None,
+        rv_7d=None,
         rv_14d=None,
-        event_risk_level="low", # set externally if there is an ETH catalyst ("low"|"medium"|"high")
+        event_risk_level="low",
         directional_bias="neutral"
     )
 
+    # --- Filtered snapshot table (debug/market context) ---
+    snapshot = filter_options(df)
+    snapshot_html = ""
+    if not snapshot.empty:
+        snapshot_html = snapshot[[
+            "symbol", "side", "strike", "expiry_date", "bid", "ask", "mid",
+            "iv", "delta", "volume", "oi", "spot"
+        ]].to_html(index=False, justify="center",
+                   float_format=lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+
+    # --- Trade ticket ---
     if trade.get("strategy") == "no_trade":
-        log.warning("No trade selected: %s", trade.get("reason"))
         subject = f"ETH Options – No Trade ({datetime.utcnow().strftime('%Y-%m-%d')})"
         body = f"""
         <html><body>
         <h3>No Trade Selected</h3>
         <p>Reason: {trade.get('reason','')}</p>
         <pre>{trade.get('decision_metrics')}</pre>
+        <h3>Filtered Market Snapshot</h3>
+        {snapshot_html}
         </body></html>
         """
     else:
-        # small legs table
         used = trade.get("used_rows", pd.DataFrame())
         legs_html = ""
         if not used.empty:
             legs_html = used[[
-                "symbol", "side", "strike", "expiry_date", "bid", "ask", "mid", "delta", "volume", "oi", "spread_pct"
-            ]].to_html(index=False, justify="center", float_format=lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+                "symbol", "side", "strike", "expiry_date", "bid", "ask", "mid",
+                "delta", "volume", "oi", "spread_pct"
+            ]].to_html(index=False, justify="center",
+                       float_format=lambda x: f"{x:.4f}" if isinstance(x, float) else x)
 
         dm = trade.get("decision_metrics", {})
         subject = f"ETH {trade['strategy'].replace('_',' ').title()} – {trade.get('expiry','')} ({datetime.utcnow().strftime('%Y-%m-%d')})"
@@ -587,6 +599,8 @@ def send_email_report(df: pd.DataFrame):
           <pre>{trade.get('entry')}</pre>
           <h3>Exits / Risk</h3>
           <pre>{trade.get('exits')}</pre>
+          <h3>Filtered Market Snapshot</h3>
+          {snapshot_html}
         </body></html>
         """
 
@@ -617,4 +631,5 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
