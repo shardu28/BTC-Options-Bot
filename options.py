@@ -270,14 +270,30 @@ def select_strangles(
         blended_rv = rv_7d
     elif rv_14d is not None:
         blended_rv = rv_14d
+    else:
+        # --- Fallback: if no RV data, enforce Greeks + liquidity filters (slightly relaxed) ---
+        df = df[
+            (df["oi"] >= 80) &
+            (df["volume"] >= 20) &
+            (df["spread_pct"] <= 3.2) &  # slightly relaxed from 2.0
+            (df["delta"].abs().between(0.15, 0.55)) &
+            (df.get("vega", 0).abs() >= 0.027) &
+            (df.get("theta", 0).abs() <= 0.11) &
+            (df.get("gamma", 0).abs() >= 0.005) &
+            (df["iv"] > 0)
+        ].copy()
+
+        if df.empty:
+            result["reason"] = "No contracts left after fallback Greeks+Liquidity filter"
+            return result
 
     # --- Global Filters from JSON ---
     GF = {
         "expiry_dte_min": 2,
         "expiry_dte_max": 7,
-        "min_open_interest": 100,
+        "min_open_interest": 80,
         "min_volume": 20,
-        "max_bid_ask_spread_pct": 2.0,
+        "max_bid_ask_spread_pct": 3.0,
         "max_slippage_pct_per_leg": 10.0,  # informational (we use spread_pct as proxy)
     }
 
@@ -348,8 +364,8 @@ def select_strangles(
     if strategy == "short_strangle":
         SS = {
             "delta_abs_min": 0.10,
-            "delta_abs_max": 0.15,
-            "net_position_delta_limit": 0.05,
+            "delta_abs_max": 0.18,
+            "net_position_delta_limit": 0.07,
             "min_net_credit_usd": 50,
         }
         calls = base[(base["side"] == "CALL") &
@@ -634,6 +650,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
