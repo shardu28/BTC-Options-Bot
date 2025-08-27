@@ -297,7 +297,8 @@ def detect_directional_bias(candles: pd.DataFrame, fast=9, slow=21):
 
 # -----------------------------
 # Insider Trader Strategy Selector (JSON -> Python)
-# -----------------------------def select_strangles(
+# -----------------------------
+    def select_strangles(
     df: pd.DataFrame, 
     *,
     iv_rank_pct: float | None = None,     # 0-100 (if None, computed from chain IV)
@@ -868,5 +869,6 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
