@@ -218,18 +218,84 @@ def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     filtered = df[cond_dte & cond_oi & cond_vol & cond_strike]
     return filtered.sort_values(['expiry_date', 'strike', 'side'])
 
+def fetch_spot_history(symbol="ETHUSD", resolution="1h", lookback_hours=72):
+    """
+    Fetch spot OHLC history from Delta API.
+    Returns: pandas.DataFrame with OHLCV or empty DataFrame on failure
+    """
+    try:
+        end = int(time.time())  # current unix time (seconds)
+        start = end - lookback_hours * 3600
+
+        url = "https://api.india.delta.exchange/v2/history/candles"
+        params = {
+            "resolution": resolution,
+            "symbol": symbol,
+            "start": start,
+            "end": end,
+        }
+        headers = {"Accept": "application/json"}
+
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("result", [])
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.sort_values("time").reset_index(drop=True)
+        return df
+
+    except Exception as e:
+        print(f"[WARN] Failed to fetch spot history for {symbol}: {e}")
+        return pd.DataFrame()
+
+def detect_directional_bias(candles: pd.DataFrame, fast=9, slow=21):
+    """
+    Detects market bias using EMAs and RSI from spot OHLC candles.
+    Fallback: returns 'neutral' if candles are missing or too short.
+    """
+    if candles.empty or len(candles) < slow + 1:
+        print("[INFO] Insufficient candles for bias calculation. Defaulting to NEUTRAL.")
+        return "neutral"
+
+    closes = candles["close"].astype(float)
+
+    # EMA calculation
+    ema_fast = closes.ewm(span=fast, adjust=False).mean()
+    ema_slow = closes.ewm(span=slow, adjust=False).mean()
+
+    # RSI calculation (14-period)
+    delta = closes.diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(14).mean()
+    avg_loss = pd.Series(loss).rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    # Bias decision
+    if ema_fast.iloc[-1] > ema_slow.iloc[-1] and rsi.iloc[-1] > 55:
+        return "bullish"
+    elif ema_fast.iloc[-1] < ema_slow.iloc[-1] and rsi.iloc[-1] < 45:
+        return "bearish"
+    else:
+        return "neutral"
+
 # -----------------------------
 # Insider Trader Strategy Selector (JSON -> Python)
 # -----------------------------
 def select_strangles(
-    df: pd.DataFrame,
+    df: pd.DataFrame, 
     *,
     iv_rank_pct: float | None = None,     # 0-100 (if None, computed from chain IV)
     iv_30d: float | None = None,          # e.g., 0.65 for 65% (optional but enables expected-move constraints)
     rv_7d: float | None = None,           # realized vol (0.xx) - optional
     rv_14d: float | None = None,          # realized vol (0.xx) - optional
     event_risk_level: str = "low",        # "low" | "medium" | "high"
-    directional_bias: str = "neutral"     # "bullish" | "bearish" | "neutral"
+    directional_bias: str = "neutral"     # must now come from external helper
 ):
     """
     Returns a dict with the selected strategy and legs, or {"strategy": "no_trade"} if nothing qualifies.
@@ -263,24 +329,6 @@ def select_strangles(
     # Spot from chain if not provided
     spot = float(df["spot"].mean())
 
-    # --- Directional Bias Detector (from IV skew) ---
-    def detect_bias(df: pd.DataFrame, skew_threshold: float = 2.0) -> str:
-        calls_iv = df[df["side"] == "CALL"]["iv"].mean()
-        puts_iv  = df[df["side"] == "PUT"]["iv"].mean()
-        if pd.isna(calls_iv) or pd.isna(puts_iv):
-            return "neutral"
-        skew = (calls_iv - puts_iv) / ((calls_iv + puts_iv) / 2) * 100
-        if skew > skew_threshold:
-            return "bearish"
-        elif skew < -skew_threshold:
-            return "bullish"
-        else:
-            return "neutral"
-
-    # Override only if not supplied
-    if directional_bias == "neutral":
-        directional_bias = detect_bias(df)
-
     # --- Blended RV logic remains same ---
     blended_rv = None
     if rv_7d is not None and rv_14d is not None:
@@ -290,7 +338,7 @@ def select_strangles(
     elif rv_14d is not None:
         blended_rv = rv_14d
     else:
-        # --- Fallback: if no RV data, enforce Greeks + liquidity filters (slightly relaxed) ---
+        # --- Fallback: if no RV data, enforce Greeks + liquidity filters ---
         df = df[
             (df["oi"] >= 70) &
             (df["volume"] >= 20) &
@@ -328,7 +376,7 @@ def select_strangles(
         result["reason"] = "No contracts left after global filters"
         return result
 
-    # --- Decision Layer (unchanged except bias now injected) ---
+    # --- Decision Layer (unchanged, bias now injected from outside) ---
     def choose_strategy():
         cheap_iv = (iv_rank_pct is not None and iv_rank_pct <= 35)
         high_iv  = (iv_rank_pct is not None and iv_rank_pct >= 50)
@@ -343,13 +391,27 @@ def select_strangles(
             iv_vs_rv_ok_long = True if cheap_iv else False
             iv_vs_rv_ok_short = True if high_iv else False
 
-        if event_risk_level in ["medium", "high"] and (cheap_iv or iv_vs_rv_ok_long):
-            return "long_strangle"
-        if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
-            return "short_strangle"
-        if (iv_rank_pct is not None and iv_rank_pct <= 30) and (iv_vs_rv_ok_long or cheap_iv) and directional_bias == "bullish":
+
+    # --- stronger directional bias integration ---
+    if directional_bias == "bullish":
+        if cheap_iv or iv_vs_rv_ok_long:
             return "long_call"
-        return "no_trade"
+        else:
+            return "bull_put_spread"   # fallback bullish play
+
+    if directional_bias == "bearish":
+        if high_iv or iv_vs_rv_ok_short:
+            return "short_call"
+        else:
+            return "bear_put_spread"   # fallback bearish play
+
+    # --- neutral bias (default strangles) ---
+    if event_risk_level in ["medium", "high"] and (cheap_iv or iv_vs_rv_ok_long):
+        return "long_strangle"
+    if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
+        return "short_strangle"
+
+    return "no_trade"
 
     strategy = choose_strategy()
     result["decision_metrics"] = {
@@ -578,7 +640,11 @@ def send_email_report(df: pd.DataFrame):
         log.error("SMTP credentials not found.")
         return
 
-    # --- Strategy selection ---
+    # --- get live directional bias from spot history ---
+    candles = fetch_spot_history(symbol="ETHUSD", resolution="1h", lookback_hours=72)
+    bias = detect_directional_bias(candles)
+
+    # --- strategy selection ---
     trade = select_strangles(
         df,
         iv_rank_pct=None,
@@ -586,7 +652,7 @@ def send_email_report(df: pd.DataFrame):
         rv_7d=None,
         rv_14d=None,
         event_risk_level="low",
-        directional_bias="neutral"
+        directional_bias=bias   # ✅ inject external bias here
     )
 
     # --- Filtered snapshot table (debug/market context) ---
@@ -668,6 +734,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
