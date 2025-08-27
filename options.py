@@ -376,44 +376,34 @@ def select_strangles(
         result["reason"] = "No contracts left after global filters"
         return result
 
-    # --- Decision Layer (unchanged, bias now injected from outside) ---
-    def choose_strategy():
+    # --- Decision Layer (fixed control flow) ---
+    def choose_strategy(iv_rank_pct, iv_30d, blended_rv, event_risk_level, directional_bias):
         cheap_iv = (iv_rank_pct is not None and iv_rank_pct <= 35)
         high_iv  = (iv_rank_pct is not None and iv_rank_pct >= 50)
 
-        iv_vs_rv_ok_long = None
-        iv_vs_rv_ok_short = None
         if iv_30d is not None and blended_rv is not None and blended_rv > 0:
             ratio = iv_30d / blended_rv
-            iv_vs_rv_ok_long = (ratio <= 1.0)
+            iv_vs_rv_ok_long  = (ratio <= 1.0)
             iv_vs_rv_ok_short = (ratio >= 1.2)
         else:
-            iv_vs_rv_ok_long = True if cheap_iv else False
-            iv_vs_rv_ok_short = True if high_iv else False
+            iv_vs_rv_ok_long  = cheap_iv
+            iv_vs_rv_ok_short = high_iv
 
+        # Directional bias first
+        if directional_bias == "bullish":
+            return "long_call" if (cheap_iv or iv_vs_rv_ok_long) else "bull_put_spread"
+        if directional_bias == "bearish":
+            return "short_call" if (high_iv or iv_vs_rv_ok_short) else "bear_put_spread"
 
-    # --- stronger directional bias integration ---
-    if directional_bias == "bullish":
-        if cheap_iv or iv_vs_rv_ok_long:
-            return "long_call"
-        else:
-            return "bull_put_spread"   # fallback bullish play
+        # Neutral bias
+        if event_risk_level in ["medium", "high"] and (cheap_iv or iv_vs_rv_ok_long):
+            return "long_strangle"
+        if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
+            return "short_strangle"
+        return "no_trade"
 
-    if directional_bias == "bearish":
-        if high_iv or iv_vs_rv_ok_short:
-            return "short_call"
-        else:
-            return "bear_put_spread"   # fallback bearish play
+    strategy = choose_strategy(iv_rank_pct, iv_30d, blended_rv, event_risk_level, directional_bias)
 
-    # --- neutral bias (default strangles) ---
-    if event_risk_level in ["medium", "high"] and (cheap_iv or iv_vs_rv_ok_long):
-        return "long_strangle"
-    if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
-        return "short_strangle"
-
-    return "no_trade"
-
-    strategy = choose_strategy()
     result["decision_metrics"] = {
         "spot": spot,
         "iv_rank_pct": iv_rank_pct,
@@ -734,21 +724,3 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
