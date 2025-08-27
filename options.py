@@ -357,11 +357,11 @@ def select_strangles(
     # --- Global Filters from JSON ---
     GF = {
         "expiry_dte_min": 1,
-        "expiry_dte_max": 12,
-        "min_open_interest": 30,
-        "min_volume": 10,
-        "max_bid_ask_spread_pct": 4.5,
-        "max_slippage_pct_per_leg": 10.0,
+        "expiry_dte_max": 14,
+        "min_open_interest": 1,
+        "min_volume": 1,
+        "max_bid_ask_spread_pct": 6,
+        "max_slippage_pct_per_leg": 15.0,
     }
 
     base = df[
@@ -734,6 +734,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
