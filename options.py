@@ -242,7 +242,6 @@ def select_strangles(
         return result
 
     # --- Safety: Clean, compute helpers ---
-    # Must-have fields for filters
     df = df.copy()
     df = df.dropna(subset=["expiry_date", "side", "strike", "bid", "ask", "mid", "delta", "oi", "volume", "iv", "spot"])
 
@@ -253,16 +252,36 @@ def select_strangles(
     # Bid-ask spread pct
     df["spread_pct"] = ((df["ask"] - df["bid"]) / df["mid"].replace(0, np.nan)) * 100
 
-    # IV rank %: if not supplied, compute from current chain IV
+    # --- IV Rank ---
     if iv_rank_pct is None:
-        # Percentile rank of current IV among all contract IVs
-        chain_iv_pct = df["iv"].rank(pct=True).mean() * 100
-        iv_rank_pct = float(np.clip(chain_iv_pct, 0, 100))
+        if "iv" in df.columns and not df["iv"].isnull().all():
+            df["iv_rank_pct"] = df["iv"].rank(pct=True) * 100
+            iv_rank_pct = float(np.clip(df["iv_rank_pct"].mean(), 0, 100))
+        else:
+            iv_rank_pct = None
 
     # Spot from chain if not provided
     spot = float(df["spot"].mean())
 
-    # Blended RV if both exist; else fall back gently
+    # --- Directional Bias Detector (from IV skew) ---
+    def detect_bias(df: pd.DataFrame, skew_threshold: float = 2.0) -> str:
+        calls_iv = df[df["side"] == "CALL"]["iv"].mean()
+        puts_iv  = df[df["side"] == "PUT"]["iv"].mean()
+        if pd.isna(calls_iv) or pd.isna(puts_iv):
+            return "neutral"
+        skew = (calls_iv - puts_iv) / ((calls_iv + puts_iv) / 2) * 100
+        if skew > skew_threshold:
+            return "bearish"
+        elif skew < -skew_threshold:
+            return "bullish"
+        else:
+            return "neutral"
+
+    # Override only if not supplied
+    if directional_bias == "neutral":
+        directional_bias = detect_bias(df)
+
+    # --- Blended RV logic remains same ---
     blended_rv = None
     if rv_7d is not None and rv_14d is not None:
         blended_rv = (rv_7d + rv_14d) / 2.0
@@ -275,7 +294,7 @@ def select_strangles(
         df = df[
             (df["oi"] >= 70) &
             (df["volume"] >= 20) &
-            (df["spread_pct"] <= 3.4) &  # slightly relaxed from 2.0
+            (df["spread_pct"] <= 3.4) &
             (df["delta"].abs().between(0.10, 0.60)) &
             (df.get("vega", 0).abs().between(0.5, 5)) &
             (df.get("theta", 0).abs() <= 8) &
@@ -290,11 +309,11 @@ def select_strangles(
     # --- Global Filters from JSON ---
     GF = {
         "expiry_dte_min": 2,
-        "expiry_dte_max": 7,
+        "expiry_dte_max": 4,
         "min_open_interest": 50,
         "min_volume": 20,
         "max_bid_ask_spread_pct": 3.0,
-        "max_slippage_pct_per_leg": 10.0,  # informational (we use spread_pct as proxy)
+        "max_slippage_pct_per_leg": 10.0,
     }
 
     base = df[
@@ -309,10 +328,10 @@ def select_strangles(
         result["reason"] = "No contracts left after global filters"
         return result
 
-    # --- Decision Layer ---
+    # --- Decision Layer (unchanged except bias now injected) ---
     def choose_strategy():
-        cheap_iv = (iv_rank_pct <= 35)
-        high_iv  = (iv_rank_pct >= 50)
+        cheap_iv = (iv_rank_pct is not None and iv_rank_pct <= 35)
+        high_iv  = (iv_rank_pct is not None and iv_rank_pct >= 50)
 
         iv_vs_rv_ok_long = None
         iv_vs_rv_ok_short = None
@@ -321,7 +340,6 @@ def select_strangles(
             iv_vs_rv_ok_long = (ratio <= 1.0)
             iv_vs_rv_ok_short = (ratio >= 1.2)
         else:
-            # If RV missing, rely only on IV rank
             iv_vs_rv_ok_long = True if cheap_iv else False
             iv_vs_rv_ok_short = True if high_iv else False
 
@@ -329,7 +347,7 @@ def select_strangles(
             return "long_strangle"
         if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
             return "short_strangle"
-        if (iv_rank_pct <= 30) and (iv_vs_rv_ok_long or cheap_iv) and directional_bias == "bullish":
+        if (iv_rank_pct is not None and iv_rank_pct <= 30) and (iv_vs_rv_ok_long or cheap_iv) and directional_bias == "bullish":
             return "long_call"
         return "no_trade"
 
@@ -650,6 +668,7 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
 
 
