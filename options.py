@@ -169,6 +169,16 @@ def to_dataframe(items):
         bid = it.quotes.best_bid if it.quotes else None
         ask = it.quotes.best_ask if it.quotes else None
 
+        # Build mid from any available side to avoid dropping one-sided books
+        if bid is None and ask is None:
+            mid = None
+        elif bid is None:
+            mid = ask
+        elif ask is None:
+            mid = bid
+        else:
+            mid = (bid + ask) / 2
+
         rows.append({
             "symbol": it.symbol,
             "side": side,
@@ -176,7 +186,7 @@ def to_dataframe(items):
             "expiry_date": expiry_date,
             "bid": bid,
             "ask": ask,
-            "mid": (bid + ask) / 2 if bid is not None and ask is not None else None,
+            "mid": mid,
             "iv": it.iv,
             "delta": it.greeks.delta if it.greeks else None,
             "gamma": it.greeks.gamma if it.greeks else None,
@@ -203,6 +213,7 @@ def filter_options(df: pd.DataFrame) -> pd.DataFrame:
     spot_price = df['spot'].mean()
 
     # Ensure expiry_date is datetime
+    df = df.copy()
     df["expiry_date"] = pd.to_datetime(df["expiry_date"])
     
     # Range tighter around spot (±5%)
@@ -309,14 +320,25 @@ def select_strangles(
 
     # --- Safety: Clean, compute helpers ---
     df = df.copy()
-    df = df.dropna(subset=["expiry_date", "side", "strike", "bid", "ask", "mid", "delta", "oi", "volume", "iv", "spot"])
+    # Require core fields, allow one-sided quotes (do not require bid/ask/mid here)
+    df = df.dropna(subset=["expiry_date", "side", "strike", "delta", "oi", "volume", "iv", "spot"])
 
-    # Compute DTE
-    today = datetime.utcnow().date()
-    df["dte"] = (pd.to_datetime(df["expiry_date"]).dt.date - today).apply(lambda d: d.days if pd.notnull(d) else None)
+    # If mid is missing, build from whichever side is available
+    missing_mid = df["mid"].isna()
+    df.loc[missing_mid & df["ask"].notna(), "mid"] = df.loc[missing_mid & df["ask"].notna(), "ask"]
+    df.loc[missing_mid & df["bid"].notna(), "mid"] = df.loc[missing_mid & df["bid"].notna(), "bid"]
 
-    # Bid-ask spread pct
-    df["spread_pct"] = ((df["ask"] - df["bid"]) / df["mid"].replace(0, np.nan)) * 100
+    # Robust DTE: ceil of fractional days to avoid off-by-one due to intraday time
+    exp_ts = pd.to_datetime(df["expiry_date"])
+    now = pd.Timestamp.utcnow()
+    df["dte"] = np.ceil((exp_ts - now) / np.timedelta64(1, "D")).astype(int)
+
+    # Bid-ask spread pct with clamped denominator; penalize one-sided books
+    denom = df["mid"].copy()
+    denom = denom.mask(denom < 1.0, 1.0)
+    df["spread_pct"] = ((df["ask"] - df["bid"]) / denom) * 100
+    one_sided = df["bid"].isna() | df["ask"].isna()
+    df.loc[one_sided, "spread_pct"] = 999.0
 
     # --- IV Rank ---
     if iv_rank_pct is None:
@@ -357,7 +379,7 @@ def select_strangles(
     # --- Global Filters from JSON ---
     GF = {
         "expiry_dte_min": 2,
-        "expiry_dte_max": 7,
+        "expiry_dte_max": 9,  # widened slightly so near-weekly and next-week survive
         "min_open_interest": 1,
         "min_volume": 1,
         "max_bid_ask_spread_pct": 6,
@@ -462,6 +484,7 @@ def select_strangles(
             # greedy match: take best by score
             for _, rc in c.iterrows():
                 # choose put that keeps net delta smallest
+                p = p.copy()
                 p["net_delta"] = (rc["delta"] + p["delta"].values)
                 candidates = p[p["net_delta"].abs() <= SS["net_position_delta_limit"]].copy()
                 if candidates.empty:
@@ -499,9 +522,11 @@ def select_strangles(
         result["expiry"] = str(rc["expiry_date"])
         result["legs"] = [
             {"action": "SELL", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
-             "delta": float(rc["delta"]), "bid": float(rc["bid"]), "ask": float(rc["ask"]), "mid": float(rc["mid"])},
+             "delta": float(rc["delta"]), "bid": float(rc["bid"]) if pd.notna(rc["bid"]) else None,
+             "ask": float(rc["ask"]) if pd.notna(rc["ask"]) else None, "mid": float(rc["mid"])},
             {"action": "SELL", "type": "PUT",  "symbol": rp["symbol"], "strike": float(rp["strike"]),
-             "delta": float(rp["delta"]), "bid": float(rp["bid"]), "ask": float(rp["ask"]), "mid": float(rp["mid"])}
+             "delta": float(rp["delta"]), "bid": float(rp["bid"]) if pd.notna(rp["bid"]) else None,
+             "ask": float(rp["ask"]) if pd.notna(rp["ask"]) else None, "mid": float(rp["mid"])}
         ]
         result["entry"] = {
             "order_type": "limit",
@@ -568,9 +593,11 @@ def select_strangles(
         result["expiry"] = str(rc["expiry_date"])
         result["legs"] = [
             {"action": "BUY", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
-             "delta": float(rc["delta"]), "bid": float(rc["bid"]), "ask": float(rc["ask"]), "mid": float(rc["mid"])},
+             "delta": float(rc["delta"]), "bid": float(rc["bid"]) if pd.notna(rc["bid"]) else None,
+             "ask": float(rc["ask"]) if pd.notna(rc["ask"]) else None, "mid": float(rc["mid"])},
             {"action": "BUY",  "type": "PUT",  "symbol": rp["symbol"], "strike": float(rp["strike"]),
-             "delta": float(rp["delta"]), "bid": float(rp["bid"]), "ask": float(rp["ask"]), "mid": float(rp["mid"])}
+             "delta": float(rp["delta"]), "bid": float(rp["bid"]) if pd.notna(rp["bid"]) else None,
+             "ask": float(rp["ask"]) if pd.notna(rp["ask"]) else None, "mid": float(rp["mid"])}
         ]
         # Entry (limit, sum of mids); exits per JSON
         result["entry"] = {"order_type": "limit", "price_basis": "sum_of_mids", "net_debit_usd": debit}
@@ -603,7 +630,8 @@ def select_strangles(
         result["expiry"] = str(rc["expiry_date"])
         result["legs"] = [
             {"action": "BUY", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
-             "delta": float(rc["delta"]), "bid": float(rc["bid"]), "ask": float(rc["ask"]), "mid": float(rc["mid"])}
+             "delta": float(rc["delta"]), "bid": float(rc["bid"]) if pd.notna(rc["bid"]) else None,
+             "ask": float(rc["ask"]) if pd.notna(rc["ask"]) else None, "mid": float(rc["mid"])}
         ]
         result["entry"] = {"order_type": "limit", "price_basis": "mid", "net_debit_usd": debit}
         result["exits"] = {
