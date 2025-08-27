@@ -297,8 +297,7 @@ def detect_directional_bias(candles: pd.DataFrame, fast=9, slow=21):
 
 # -----------------------------
 # Insider Trader Strategy Selector (JSON -> Python)
-# -----------------------------
-def select_strangles(
+# -----------------------------def select_strangles(
     df: pd.DataFrame, 
     *,
     iv_rank_pct: float | None = None,     # 0-100 (if None, computed from chain IV)
@@ -306,7 +305,7 @@ def select_strangles(
     rv_7d: float | None = None,           # realized vol (0.xx) - optional
     rv_14d: float | None = None,          # realized vol (0.xx) - optional
     event_risk_level: str = "low",        # "low" | "medium" | "high"
-    directional_bias: str = "neutral"     # must now come from external helper
+    directional_bias: str = "neutral"     # "bullish" | "bearish" | "neutral"
 ):
     """
     Returns a dict with the selected strategy and legs, or {"strategy": "no_trade"} if nothing qualifies.
@@ -351,8 +350,7 @@ def select_strangles(
     # Spot from chain if not provided
     spot = float(df["spot"].mean())
 
-    # --- Blended RV logic remains same ---
-    blended_rv = None
+    # --- Blended RV logic ---
     if rv_7d is not None and rv_14d is not None:
         blended_rv = (rv_7d + rv_14d) / 2.0
     elif rv_7d is not None:
@@ -360,21 +358,8 @@ def select_strangles(
     elif rv_14d is not None:
         blended_rv = rv_14d
     else:
-        # --- Fallback: if no RV data, enforce Greeks + liquidity filters ---
-        df = df[
-            (df["oi"] >= 70) &
-            (df["volume"] >= 20) &
-            (df["spread_pct"] <= 3.4) &
-            (df["delta"].abs().between(0.10, 0.75)) &
-            (df.get("vega", 0).abs().between(0.3, 6)) &
-            (df.get("theta", 0).abs() <= 15) &
-            (df.get("gamma", 0).abs().between(0.0002, 0.005)) &
-            (df["iv"] > 0)
-        ].copy()
-
-        if df.empty:
-            result["reason"] = "No contracts left after fallback Greeks+Liquidity filter"
-            return result
+        # No RV data provided: rely on Global Filters below (avoid strict pre-filter that can wipe chain)
+        blended_rv = None
 
     # --- Global Filters from JSON ---
     GF = {
@@ -395,11 +380,13 @@ def select_strangles(
     ].copy()
 
     if base.empty:
-        result["reason"] = "No contracts left after global filters"
+        result["reason"] = f"No contracts left after global filters (len(df)={len(df)})"
         return result
 
-    # --- Decision Layer (fixed control flow) ---
-    def choose_strategy(iv_rank_pct, iv_30d, blended_rv, event_risk_level, directional_bias):
+    sides_present = set(base["side"].unique())
+
+    # --- Decision Layer (side-aware, returns only implementable strategies) ---
+    def choose_strategy(iv_rank_pct, iv_30d, blended_rv, event_risk_level, directional_bias, sides_present):
         cheap_iv = (iv_rank_pct is not None and iv_rank_pct <= 35)
         high_iv  = (iv_rank_pct is not None and iv_rank_pct >= 50)
 
@@ -411,20 +398,41 @@ def select_strangles(
             iv_vs_rv_ok_long  = cheap_iv
             iv_vs_rv_ok_short = high_iv
 
-        # Directional bias first
+        have_calls = "CALL" in sides_present
+        have_puts  = "PUT" in sides_present
+
+        # Directional bias first, but only return strategies we implement and have legs for
         if directional_bias == "bullish":
-            return "long_call" if (cheap_iv or iv_vs_rv_ok_long) else "bull_put_spread"
+            if have_calls and iv_vs_rv_ok_long:
+                return "long_call"
+            if have_puts and iv_vs_rv_ok_short and event_risk_level == "low":
+                return "short_put"
+            return "no_trade"
+
         if directional_bias == "bearish":
-            return "short_call" if (high_iv or iv_vs_rv_ok_short) else "bear_put_spread"
+            if have_calls and iv_vs_rv_ok_short and event_risk_level == "low":
+                return "short_call"
+            # (Optional: long_put can be added if desired)
+            return "no_trade"
 
         # Neutral bias
-        if event_risk_level in ["medium", "high"] and (cheap_iv or iv_vs_rv_ok_long):
-            return "long_strangle"
-        if high_iv and iv_vs_rv_ok_short and event_risk_level == "low":
-            return "short_strangle"
+        if have_calls and have_puts:
+            if (event_risk_level in ["medium", "high"]) and iv_vs_rv_ok_long:
+                return "long_strangle"
+            if iv_vs_rv_ok_short and event_risk_level == "low":
+                return "short_strangle"
+        else:
+            # One-sided chain fallbacks
+            if have_puts and iv_vs_rv_ok_short and event_risk_level == "low":
+                return "short_put"
+            if have_calls and iv_vs_rv_ok_short and event_risk_level == "low":
+                return "short_call"
+            if have_calls and iv_vs_rv_ok_long and event_risk_level in ["medium", "high"]:
+                return "long_call"
+
         return "no_trade"
 
-    strategy = choose_strategy(iv_rank_pct, iv_30d, blended_rv, event_risk_level, directional_bias)
+    strategy = choose_strategy(iv_rank_pct, iv_30d, blended_rv, event_risk_level, directional_bias, sides_present)
 
     result["decision_metrics"] = {
         "spot": spot,
@@ -437,6 +445,7 @@ def select_strangles(
         "directional_bias": directional_bias,
         "chosen": strategy,
     }
+    result["sides_present"] = sorted(list(sides_present))
 
     if strategy == "no_trade":
         result["strategy"] = "no_trade"
@@ -452,13 +461,13 @@ def select_strangles(
         dev = abs(row["strike"] - spot)
         return (dev >= em * 1.0) and (dev <= em * 1.5)
 
-    # Short strangle selection
+    # --- Short strangle selection ---
     if strategy == "short_strangle":
         SS = {
             "delta_abs_min": 0.10,
             "delta_abs_max": 0.18,
             "net_position_delta_limit": 0.07,
-            "min_net_credit_usd": 50,
+            "min_net_credit_usd": 50.0,
         }
         calls = base[(base["side"] == "CALL") &
                      (base["delta"].between(SS["delta_abs_min"], SS["delta_abs_max"]))].copy()
@@ -481,16 +490,18 @@ def select_strangles(
             p = puts[puts["expiry_date"] == exp]
             if c.empty or p.empty:
                 continue
-            # greedy match: take best by score
             for _, rc in c.iterrows():
-                # choose put that keeps net delta smallest
-                p = p.copy()
-                p["net_delta"] = (rc["delta"] + p["delta"].values)
-                candidates = p[p["net_delta"].abs() <= SS["net_position_delta_limit"]].copy()
+                pp = p.copy()
+                pp["net_delta"] = (rc["delta"] + pp["delta"].values)
+                candidates = pp[pp["net_delta"].abs() <= SS["net_position_delta_limit"]].copy()
                 if candidates.empty:
                     continue
                 candidates["credit"] = rc["mid"] + candidates["mid"]
-                candidates["score"] = candidates["credit"] - 0.1*(rc["spread_pct"] + candidates["spread_pct"]) - 10*candidates["net_delta"].abs()
+                candidates["score"] = (
+                    candidates["credit"]
+                    - 0.1 * (rc["spread_pct"] + candidates["spread_pct"])
+                    - 10.0 * candidates["net_delta"].abs()
+                )
                 best = candidates.sort_values("score", ascending=False).head(1)
                 if not best.empty:
                     pairs.append((rc, best.iloc[0]))
@@ -507,7 +518,7 @@ def select_strangles(
             credit = rc["mid"] + rp["mid"]
             if credit < SS["min_net_credit_usd"]:
                 continue
-            score = credit - 0.1*(rc["spread_pct"] + rp["spread_pct"])
+            score = credit - 0.1 * (rc["spread_pct"] + rp["spread_pct"])
             if score > best_score:
                 best_score = score
                 best_pair = (rc, rp, credit)
@@ -544,10 +555,9 @@ def select_strangles(
             "time_exit_hours": 24
         }
         result["used_rows"] = pd.DataFrame([rc, rp])
-
         return result
 
-    # Long strangle selection
+    # --- Long strangle selection ---
     if strategy == "long_strangle":
         LS = {
             "delta_abs_min": 0.25,
@@ -572,7 +582,6 @@ def select_strangles(
             for _, rc in c.iterrows():
                 cand = p.copy()
                 cand["debit"] = rc["mid"] + cand["mid"]
-                # prefer bigger vega exposure per dollar
                 cand["score"] = ((rc.get("vega", 0) + cand.get("vega", 0)) / cand["debit"].replace(0, np.nan))
                 best = cand.sort_values("score", ascending=False).head(1)
                 if not best.empty:
@@ -583,8 +592,8 @@ def select_strangles(
             result["reason"] = "No call-put pairs for long strangle"
             return result
 
-        # Choose best by score
-        scores = [((rc.get("vega", 0) + rp.get("vega", 0)) / max(rc["mid"] + rp["mid"], 1e-9)) for rc, rp in [(p[0], p[1]) for p in pairs]]
+        scores = [((rc.get("vega", 0) + rp.get("vega", 0)) / max(rc["mid"] + rp["mid"], 1e-9))
+                  for rc, rp in [(p[0], p[1]) for p in pairs]]
         idx = int(np.argmax(scores))
         rc, rp = pairs[idx]
         debit = float(round(rc["mid"] + rp["mid"], 2))
@@ -599,7 +608,6 @@ def select_strangles(
              "delta": float(rp["delta"]), "bid": float(rp["bid"]) if pd.notna(rp["bid"]) else None,
              "ask": float(rp["ask"]) if pd.notna(rp["ask"]) else None, "mid": float(rp["mid"])}
         ]
-        # Entry (limit, sum of mids); exits per JSON
         result["entry"] = {"order_type": "limit", "price_basis": "sum_of_mids", "net_debit_usd": debit}
         result["exits"] = {
             "take_profit_combo_sell_primary": round(debit * 1.50, 2),
@@ -611,7 +619,7 @@ def select_strangles(
         result["used_rows"] = pd.DataFrame([rc, rp])
         return result
 
-    # Long call selection
+    # --- Long call selection ---
     if strategy == "long_call":
         LC = {"call_delta_min": 0.30, "call_delta_max": 0.45}
         calls = base[(base["side"] == "CALL") &
@@ -622,7 +630,7 @@ def select_strangles(
             return result
 
         # prefer high vega / $ and tight spread
-        calls["score"] = (calls.get("vega", 0) / calls["mid"].replace(0, np.nan)) - 0.05*calls["spread_pct"]
+        calls["score"] = (calls.get("vega", 0) / calls["mid"].replace(0, np.nan)) - 0.05 * calls["spread_pct"]
         rc = calls.sort_values("score", ascending=False).head(1).iloc[0]
         debit = float(round(rc["mid"], 2))
 
@@ -643,10 +651,118 @@ def select_strangles(
         result["used_rows"] = pd.DataFrame([rc])
         return result
 
-    # Fallback
+    # --- Short put selection (one-sided fallback or bullish/neutral short-vol idea) ---
+    if strategy == "short_put":
+        SP = {
+            "delta_abs_min": 0.12,
+            "delta_abs_max": 0.25,
+            "min_credit_usd": 10.0,
+        }
+        puts = base[
+            (base["side"] == "PUT") &
+            (base["delta"].between(-SP["delta_abs_max"], -SP["delta_abs_min"]))
+        ].copy()
+
+        if puts.empty:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No puts in delta band for short_put"
+            return result
+
+        # Prefer higher credit, tighter spreads, healthier OI/volume
+        puts["score"] = (
+            puts["mid"]
+            - 0.10 * puts["spread_pct"]
+            + 0.005 * puts["oi"]
+            + 0.01 * puts["volume"]
+        )
+        rp = puts.sort_values("score", ascending=False).head(1).iloc[0]
+        credit = float(round(rp["mid"], 2))
+        if credit < SP["min_credit_usd"]:
+            result["strategy"] = "no_trade"
+            result["reason"] = "short_put credit below minimum"
+            return result
+
+        result["strategy"] = "short_put"
+        result["expiry"] = str(rp["expiry_date"])
+        result["legs"] = [{
+            "action": "SELL", "type": "PUT", "symbol": rp["symbol"], "strike": float(rp["strike"]),
+            "delta": float(rp["delta"]),
+            "bid": float(rp["bid"]) if pd.notna(rp["bid"]) else None,
+            "ask": float(rp["ask"]) if pd.notna(rp["ask"]) else None,
+            "mid": float(rp["mid"])
+        }]
+        result["entry"] = {
+            "order_type": "limit",
+            "price_basis": "mid",
+            "net_credit_usd": credit
+        }
+        result["exits"] = {
+            "take_profit_buy_debit": round(credit * 0.50, 2),
+            "stop_loss_buy_debit": round(credit * 3.00, 2),
+            "delta_stop_threshold": 0.30,
+            "time_exit_hours": 24
+        }
+        result["used_rows"] = pd.DataFrame([rp])
+        return result
+
+    # --- Short call selection (one-sided fallback or bearish/neutral short-vol idea) ---
+    if strategy == "short_call":
+        SC = {
+            "delta_abs_min": 0.12,
+            "delta_abs_max": 0.25,
+            "min_credit_usd": 10.0,
+        }
+        calls = base[
+            (base["side"] == "CALL") &
+            (base["delta"].between(SC["delta_abs_min"], SC["delta_abs_max"]))
+        ].copy()
+
+        if calls.empty:
+            result["strategy"] = "no_trade"
+            result["reason"] = "No calls in delta band for short_call"
+            return result
+
+        calls["score"] = (
+            calls["mid"]
+            - 0.10 * calls["spread_pct"]
+            + 0.005 * calls["oi"]
+            + 0.01 * calls["volume"]
+        )
+        rc = calls.sort_values("score", ascending=False).head(1).iloc[0]
+        credit = float(round(rc["mid"], 2))
+        if credit < SC["min_credit_usd"]:
+            result["strategy"] = "no_trade"
+            result["reason"] = "short_call credit below minimum"
+            return result
+
+        result["strategy"] = "short_call"
+        result["expiry"] = str(rc["expiry_date"])
+        result["legs"] = [{
+            "action": "SELL", "type": "CALL", "symbol": rc["symbol"], "strike": float(rc["strike"]),
+            "delta": float(rc["delta"]),
+            "bid": float(rc["bid"]) if pd.notna(rc["bid"]) else None,
+            "ask": float(rc["ask"]) if pd.notna(rc["ask"]) else None,
+            "mid": float(rc["mid"])
+        }]
+        result["entry"] = {
+            "order_type": "limit",
+            "price_basis": "mid",
+            "net_credit_usd": credit
+        }
+        result["exits"] = {
+            "take_profit_buy_debit": round(credit * 0.50, 2),
+            "stop_loss_buy_debit": round(credit * 3.00, 2),
+            "delta_stop_threshold": 0.30,
+            "time_exit_hours": 24
+        }
+        result["used_rows"] = pd.DataFrame([rc])
+        return result
+
+    # --- Fallback ---
     result["strategy"] = "no_trade"
     result["reason"] = "Unhandled branch"
     return result
+
     
 # -----------------------------
 # Email sending (trade ticket + snapshot table)
@@ -752,4 +868,5 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
 
