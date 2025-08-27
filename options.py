@@ -329,8 +329,8 @@ def select_strangles(
     df.loc[missing_mid & df["bid"].notna(), "mid"] = df.loc[missing_mid & df["bid"].notna(), "bid"]
 
     # Robust DTE: ceil of fractional days to avoid off-by-one due to intraday time
-    exp_ts = pd.to_datetime(df["expiry_date"])
-    now = pd.Timestamp.utcnow()
+    exp_ts = pd.to_datetime(df["expiry_date"]).dt.tz_localize(None)
+    now = pd.Timestamp.utcnow().tz_localize(None)
     df["dte"] = np.ceil((exp_ts - now) / np.timedelta64(1, "D")).astype(int)
 
     # Bid-ask spread pct with clamped denominator; penalize one-sided books
@@ -752,3 +752,4 @@ if __name__ == "__main__":
         log.info("Fetched %d contracts", len(df))
         print(df.head(10))
     send_email_report(df)
+
